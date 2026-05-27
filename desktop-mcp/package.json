@@ -1,0 +1,16 @@
+{
+  "name": "android-ui-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ADB-backed MCP server for Android UI automation.",
+  "scripts": {
+    "build": "node --check src/server.ts",
+    "start": "node src/server.ts",
+    "dev": "node src/server.ts",
+    "typecheck": "node --check src/server.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
