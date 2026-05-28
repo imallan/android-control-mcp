@@ -52,16 +52,27 @@ Optional environment variables:
 
 ## MCP Client Configuration
 
-Use `node src/server.ts` from this directory as the MCP stdio command after building. Avoid launching through plain `npm run start` for stdio clients unless it is run silently, because npm can print lifecycle text to stdout and MCP stdout must contain only JSON-RPC messages.
+Use the repository launcher for Codex and other stdio MCP clients. It auto-selects the connected Android device when exactly one device is authorized, respects `ANDROID_SERIAL` when set, and then starts `node src/server.ts`. Avoid launching through plain `npm run start` for stdio clients unless it is run silently, because npm can print lifecycle text to stdout and MCP stdout must contain only JSON-RPC messages.
 
 ```json
 {
   "mcpServers": {
     "android-ui-mcp": {
-      "command": "node",
-      "args": [
-        "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
-      ],
+      "command": "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh",
+      "args": []
+    }
+  }
+}
+```
+
+If multiple Android devices are connected, set `ANDROID_SERIAL`:
+
+```json
+{
+  "mcpServers": {
+    "android-ui-mcp": {
+      "command": "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh",
+      "args": [],
       "env": {
         "ANDROID_SERIAL": "16011JEC202078"
       }
@@ -74,8 +85,7 @@ For Codex, install the server with:
 
 ```sh
 codex mcp add android-ui-mcp \
-  --env ANDROID_SERIAL=16011JEC202078 \
-  -- node "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
+  -- "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh"
 ```
 
 Restart or reload Codex after installation so it discovers the tools.

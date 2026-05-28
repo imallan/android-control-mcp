@@ -10,7 +10,7 @@ This repository implements an Android UI MCP bridge. The desktop MCP server expo
 android-server/   Kotlin UIAutomator process server
 desktop-mcp/      TypeScript MCP stdio server
 docs/             Architecture, protocol, and compatibility notes
-scripts/          Helper scripts
+scripts/          Helper scripts and MCP launchers
 ```
 
 ## Run
@@ -42,14 +42,17 @@ Install the desktop MCP server globally with the Codex CLI:
 
 ```sh
 codex mcp add android-ui-mcp \
-  --env ANDROID_SERIAL=16011JEC202078 \
-  -- node "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
+  -- "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh"
 ```
 
-Use your own device serial if needed:
+The launcher auto-selects the connected Android device when exactly one device is authorized. If multiple devices are connected, set a serial explicitly:
 
 ```sh
 adb devices
+codex mcp remove android-ui-mcp
+codex mcp add android-ui-mcp \
+  --env ANDROID_SERIAL=<device-serial> \
+  -- "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh"
 ```
 
 Keep the Android-side bridge running before using the MCP tools:
