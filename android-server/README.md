@@ -19,16 +19,24 @@ commands over `localabstract:android-ui-mcp`.
 android-server/scripts/build-uiautomator-jar.sh
 ```
 
-The script uses the local Android SDK directly, without Gradle:
+The script delegates to the repository Gradle wrapper:
+
+```sh
+./gradlew :android-server:buildUiautomatorJar
+```
+
+The Gradle task still uses the local Android SDK directly:
 
 - `platforms/android-36/android.jar`
 - `platforms/android-36/uiautomator.jar`
 - `build-tools/37.0.0/d8`
+- Android Studio's bundled Kotlin compiler by default:
+  `/Applications/Android Studio.app/Contents/plugins/Kotlin/kotlinc/bin/kotlinc`
 
 Override with:
 
 ```sh
-ANDROID_SDK_ROOT=/path/to/sdk ANDROID_PLATFORM=android-36.1 ANDROID_BUILD_TOOLS=36.1.0 \
+ANDROID_SDK_ROOT=/path/to/sdk ANDROID_PLATFORM=android-36.1 ANDROID_BUILD_TOOLS=36.1.0 KOTLINC=/path/to/kotlinc \
   android-server/scripts/build-uiautomator-jar.sh
 ```
 

@@ -7,7 +7,7 @@ This repository currently implements the Phase 1 MVP from `android-ui-mcp-bridge
 ## Layout
 
 ```text
-android-server/   Phase 2 placeholder for the Android shell process server
+android-server/   Phase 2 Kotlin UIAutomator process server prototype
 desktop-mcp/      Phase 1 TypeScript MCP stdio server
 docs/             Architecture, protocol, and compatibility notes
 scripts/          Helper scripts
