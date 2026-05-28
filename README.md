@@ -35,3 +35,27 @@ Requirements:
 - One authorized Android device, or `ANDROID_SERIAL` set
 
 The MCP server has no npm dependencies; it runs directly on Node 24's TypeScript support.
+
+## Install in Codex
+
+Install the desktop MCP server globally with the Codex CLI:
+
+```sh
+codex mcp add android-ui-mcp \
+  --env ANDROID_SERIAL=16011JEC202078 \
+  -- node "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
+```
+
+Use your own device serial if needed:
+
+```sh
+adb devices
+```
+
+Keep the Android-side bridge running before using the MCP tools:
+
+```sh
+android-server/scripts/start-uiautomator-server.sh
+```
+
+Restart or reload Codex after installing the MCP server. Codex discovers MCP tools when a session starts, so newly installed tools usually appear in a fresh thread.

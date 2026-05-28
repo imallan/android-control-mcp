@@ -52,19 +52,33 @@ Optional environment variables:
 
 ## MCP Client Configuration
 
-Use `npm run start` from this directory as the MCP stdio command after building.
+Use `node src/server.ts` from this directory as the MCP stdio command after building. Avoid launching through plain `npm run start` for stdio clients unless it is run silently, because npm can print lifecycle text to stdout and MCP stdout must contain only JSON-RPC messages.
 
 ```json
 {
   "mcpServers": {
     "android-ui-mcp": {
-      "command": "npm",
-      "args": ["run", "start"],
-      "cwd": "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp"
+      "command": "node",
+      "args": [
+        "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
+      ],
+      "env": {
+        "ANDROID_SERIAL": "16011JEC202078"
+      }
     }
   }
 }
 ```
+
+For Codex, install the server with:
+
+```sh
+codex mcp add android-ui-mcp \
+  --env ANDROID_SERIAL=16011JEC202078 \
+  -- node "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp/src/server.ts"
+```
+
+Restart or reload Codex after installation so it discovers the tools.
 
 ## Transport Notes
 
