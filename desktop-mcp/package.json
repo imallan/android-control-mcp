@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "ADB-backed MCP server for Android UI automation.",
+  "description": "MCP server for Android UI automation through a persistent on-device bridge.",
   "scripts": {
     "build": "node --check src/server.ts",
     "start": "node src/server.ts",

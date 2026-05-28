@@ -1,6 +1,25 @@
 # Architecture
 
-## Phase 1 MVP
+## Current Architecture
+
+```text
+LLM
+ ↓ MCP stdio
+Desktop MCP Server
+ ↓ adb forward tcp:27183
+Android UIAutomator Bridge
+ ↓
+Android shell/UIAutomator APIs
+```
+
+The desktop MCP server remains the MCP stdio process. It refreshes the `adb forward`
+mapping and sends newline-delimited JSON requests to the Android-side bridge for
+UIAutomator operations.
+
+Direct ADB commands are still used for capabilities not yet implemented by the bridge:
+screenshot capture, text input, app listing, and app launch.
+
+## Earlier MVP
 
 ```text
 LLM
@@ -9,19 +28,3 @@ Desktop MCP Server
  ↓ adb commands
 Android device
 ```
-
-The MVP validates the agent loop before introducing Android-side persistent infrastructure.
-
-## Phase 2 Target
-
-```text
-LLM
- ↓ MCP
-Desktop MCP Server
- ↓ adb forward tcp:27183
-Android Shell Process Server
- ↓
-Android shell/system APIs
-```
-
-The Android server runs as uid `shell` via `app_process`, enabling screenshot, UIAutomator, and input capabilities without root.

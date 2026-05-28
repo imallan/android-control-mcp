@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, unlink, writeFile } from "node:fs/promises";
+import net from "node:net";
 import { tmpdir } from "node:os";
+import { performance } from "node:perf_hooks";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -26,6 +28,15 @@ type AndroidApp = {
   aliases: string[];
 };
 
+type NodeSelector = {
+  text?: string;
+  contentDesc?: string;
+  resourceId?: string;
+  className?: string;
+  bounds?: string;
+  occurrence?: number;
+};
+
 type ToolDefinition = {
   name: string;
   description: string;
@@ -36,6 +47,9 @@ type ToolDefinition = {
 const DEFAULT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_ADB_TIMEOUT_MS ?? 15_000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_SCREENSHOT_TIMEOUT_MS ?? 20_000);
 const APP_LIST_TIMEOUT_MS = Number(process.env.ANDROID_MCP_APP_LIST_TIMEOUT_MS ?? 60_000);
+const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
+const BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
+const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
 
 const KEYCODES: Record<string, string> = {
   BACK: "KEYCODE_BACK",
@@ -58,6 +72,16 @@ class AdbCommandError extends Error {
   constructor(message: string, details: Record<string, unknown>) {
     super(message);
     this.name = "AdbCommandError";
+    this.details = details;
+  }
+}
+
+class AndroidBridgeError extends Error {
+  readonly details: Record<string, unknown>;
+
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message);
+    this.name = "AndroidBridgeError";
     this.details = details;
   }
 }
@@ -100,6 +124,84 @@ async function execText(command: string, args: string[], timeoutMs = DEFAULT_TIM
     maxBuffer: 16 * 1024 * 1024
   });
   return stdout;
+}
+
+async function androidBridgeRpc(method: string, params: Record<string, string | number | boolean> = {}): Promise<Record<string, unknown>> {
+  await ensureAndroidBridgeForward();
+
+  const start = performance.now();
+  const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
+    const socket = net.createConnection({ host: BRIDGE_HOST, port: BRIDGE_PORT });
+    let buffer = "";
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    function settle(error: Error | undefined, value?: Record<string, unknown>): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      socket.destroy();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(value ?? {});
+      }
+    }
+
+    timeout = setTimeout(() => {
+      settle(
+        new AndroidBridgeError("Android bridge request timed out.", {
+          method,
+          host: BRIDGE_HOST,
+          port: BRIDGE_PORT,
+          timeoutMs: BRIDGE_TIMEOUT_MS,
+          hint: "Start android-server/scripts/start-uiautomator-server.sh and confirm adb forward is active."
+        })
+      );
+    }, BRIDGE_TIMEOUT_MS);
+
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ method, ...params })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = buffer.slice(0, newlineIndex);
+      try {
+        settle(undefined, JSON.parse(line) as Record<string, unknown>);
+      } catch (error) {
+        settle(error as Error);
+      }
+    });
+    socket.on("error", (error) => {
+      settle(
+        new AndroidBridgeError(`Android bridge connection failed: ${error.message}`, {
+          method,
+          host: BRIDGE_HOST,
+          port: BRIDGE_PORT,
+          hint: "Start android-server/scripts/start-uiautomator-server.sh. The MCP server talks to that process through adb forward."
+        })
+      );
+    });
+  });
+
+  response.hostElapsedMs = Math.round(performance.now() - start);
+  if (response.ok !== true) {
+    throw new AndroidBridgeError(`Android bridge ${method} failed.`, { method, response });
+  }
+  return response;
+}
+
+async function ensureAndroidBridgeForward(): Promise<void> {
+  await adbText(["forward", `tcp:${BRIDGE_PORT}`, "localabstract:android-ui-mcp"]);
 }
 
 function normalizeAdbError(args: string[], error: unknown): AdbCommandError {
@@ -184,6 +286,14 @@ function numberParam(input: Record<string, unknown>, name: string): number {
   return value as number;
 }
 
+function positiveNumberParam(input: Record<string, unknown>, name: string): number {
+  const value = numberParam(input, name);
+  if (value < 1) {
+    throw new ToolInputError(`${name} must be a positive integer.`);
+  }
+  return value;
+}
+
 function stringParam(input: Record<string, unknown>, name: string): string {
   const value = input[name];
   if (typeof value !== "string" || value.length === 0) {
@@ -212,6 +322,53 @@ function optionalBooleanParam(input: Record<string, unknown>, name: string, defa
     throw new ToolInputError(`${name} must be a boolean when provided.`);
   }
   return value;
+}
+
+function optionalSelectorParam(input: Record<string, unknown>, name: string): NodeSelector | undefined {
+  const value = input[name];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const selector = expectObject(value);
+  const occurrenceValue = selector.occurrence;
+  if (occurrenceValue !== undefined && (!Number.isInteger(occurrenceValue) || (occurrenceValue as number) < 1)) {
+    throw new ToolInputError("selector.occurrence must be a positive integer when provided.");
+  }
+  return {
+    text: optionalStringParam(selector, "text"),
+    contentDesc: optionalStringParam(selector, "contentDesc"),
+    resourceId: optionalStringParam(selector, "resourceId"),
+    className: optionalStringParam(selector, "className"),
+    bounds: optionalStringParam(selector, "bounds"),
+    occurrence: occurrenceValue as number | undefined
+  };
+}
+
+function selectorHasAnyField(selector: NodeSelector): boolean {
+  return Boolean(selector.text || selector.contentDesc || selector.resourceId || selector.className || selector.bounds);
+}
+
+function flattenSelector(selector: NodeSelector): Record<string, string | number> {
+  const params: Record<string, string | number> = {};
+  if (selector.text !== undefined) {
+    params.targetText = selector.text;
+  }
+  if (selector.contentDesc !== undefined) {
+    params.targetContentDesc = selector.contentDesc;
+  }
+  if (selector.resourceId !== undefined) {
+    params.targetResourceId = selector.resourceId;
+  }
+  if (selector.className !== undefined) {
+    params.targetClassName = selector.className;
+  }
+  if (selector.bounds !== undefined) {
+    params.targetBounds = selector.bounds;
+  }
+  if (selector.occurrence !== undefined) {
+    params.targetOccurrence = selector.occurrence;
+  }
+  return params;
 }
 
 function parsePngSize(png: Buffer): { width: number; height: number } {
@@ -252,20 +409,27 @@ async function androidScreenshot(input: unknown): Promise<ToolResult> {
 }
 
 async function androidDumpTree(): Promise<ToolResult> {
-  await adbText(["shell", "uiautomator", "dump", "/sdcard/window.xml"]);
-  const xml = await adbText(["exec-out", "cat", "/sdcard/window.xml"]);
-  if (!xml.includes("<hierarchy")) {
-    throw new Error("uiautomator dump did not return a hierarchy XML document.");
+  const response = await androidBridgeRpc("dumpXml");
+  const xml = response.xml;
+  if (typeof xml !== "string") {
+    throw new AndroidBridgeError("Android bridge dumpXml response did not include XML.", { response });
   }
-  return { xml };
+  if (!xml.includes("<hierarchy")) {
+    throw new Error("UIAutomator bridge did not return a hierarchy XML document.");
+  }
+  return response;
+}
+
+async function androidDumpCompact(): Promise<ToolResult> {
+  return androidBridgeRpc("dumpCompact");
 }
 
 async function androidTap(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const x = numberParam(params, "x");
   const y = numberParam(params, "y");
-  await adbText(["shell", "input", "tap", String(x), String(y)]);
-  return { success: true };
+  const response = await androidBridgeRpc("tap", { x, y });
+  return normalizeBridgeSuccess(response);
 }
 
 async function androidSwipe(input: unknown): Promise<ToolResult> {
@@ -275,16 +439,58 @@ async function androidSwipe(input: unknown): Promise<ToolResult> {
   const x2 = numberParam(params, "x2");
   const y2 = numberParam(params, "y2");
   const durationMs = params.durationMs === undefined ? 300 : numberParam(params, "durationMs");
-  await adbText(["shell", "input", "swipe", String(x1), String(y1), String(x2), String(y2), String(durationMs)]);
-  return { success: true };
+  const steps = params.steps === undefined ? Math.max(1, Math.round(durationMs / 5)) : positiveNumberParam(params, "steps");
+  const response = await androidBridgeRpc("swipe", { x1, y1, x2, y2, steps });
+  return normalizeBridgeSuccess({ ...response, steps });
 }
 
 async function androidInputText(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const text = stringParam(params, "text");
+  const selector = optionalSelectorParam(params, "selector");
+  const pressEnter = optionalBooleanParam(params, "pressEnter", false);
+
+  if (selector && selectorHasAnyField(selector)) {
+    const response = await androidBridgeRpc("inputText", {
+      text,
+      ...flattenSelector(selector)
+    });
+    const result = normalizeBridgeSuccess(response);
+    if (pressEnter) {
+      await androidBridgeRpc("key", { key: "ENTER" });
+    }
+    return result;
+  }
+
   const encoded = encodeAndroidInputText(text);
-  await adbText(["shell", `input text ${shellQuote(encoded)}`]);
-  return { success: true };
+  await adbText(["shell", "input", "text", encoded]);
+  if (pressEnter) {
+    await androidBridgeRpc("key", { key: "ENTER" });
+  }
+  return { success: true, text };
+}
+
+async function androidPerformAction(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const action = stringParam(params, "action");
+  const selector = optionalSelectorParam(params, "selector");
+  if (!selector || !selectorHasAnyField(selector)) {
+    throw new ToolInputError("selector is required and must identify a node.");
+  }
+  const response = await androidBridgeRpc("performAction", {
+    action,
+    ...flattenSelector(selector)
+  });
+  return normalizeBridgeSuccess(response);
+}
+
+async function androidLongPress(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const x = numberParam(params, "x");
+  const y = numberParam(params, "y");
+  const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
+  await adbText(["shell", "input", "swipe", String(x), String(y), String(x), String(y), String(durationMs)]);
+  return { success: true, x, y, durationMs };
 }
 
 async function androidKey(input: unknown): Promise<ToolResult> {
@@ -294,8 +500,25 @@ async function androidKey(input: unknown): Promise<ToolResult> {
   if (!keycode) {
     throw new ToolInputError(`key must be one of: ${Object.keys(KEYCODES).join(", ")}.`);
   }
-  await adbText(["shell", "input", "keyevent", keycode]);
-  return { success: true, key, keycode };
+  const response = await androidBridgeRpc("key", { key });
+  return normalizeBridgeSuccess({ ...response, key, keycode });
+}
+
+async function androidBridgePing(input: unknown): Promise<ToolResult> {
+  optionalObject(input);
+  return androidBridgeRpc("ping");
+}
+
+async function androidBridgeExit(input: unknown): Promise<ToolResult> {
+  optionalObject(input);
+  return normalizeBridgeSuccess(await androidBridgeRpc("exit"));
+}
+
+function normalizeBridgeSuccess(response: Record<string, unknown>): ToolResult {
+  return {
+    ...response,
+    success: response.success === true
+  };
 }
 
 async function androidListApps(input: unknown): Promise<ToolResult> {
@@ -615,8 +838,33 @@ function titleCase(value: string): string {
 }
 
 const integerSchema = { type: "integer", minimum: 0 };
+const positiveIntegerSchema = { type: "integer", minimum: 1 };
+const selectorSchema = {
+  type: "object",
+  properties: {
+    text: { type: "string", minLength: 1 },
+    contentDesc: { type: "string", minLength: 1 },
+    resourceId: { type: "string", minLength: 1 },
+    className: { type: "string", minLength: 1 },
+    bounds: { type: "string", minLength: 1 },
+    occurrence: { type: "integer", minimum: 1, default: 1 }
+  },
+  additionalProperties: false
+};
 
 const tools: ToolDefinition[] = [
+  {
+    name: "android_bridge_ping",
+    description: "Check that the persistent on-device UIAutomator bridge is reachable through adb forward.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidBridgePing
+  },
+  {
+    name: "android_bridge_exit",
+    description: "Ask the persistent on-device UIAutomator bridge to stop serving requests.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidBridgeExit
+  },
   {
     name: "android_screenshot",
     description: "Capture the current Android screen with adb exec-out screencap -p and return a local PNG path plus dimensions.",
@@ -635,7 +883,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_dump_tree",
-    description: "Dump the current Android accessibility tree with uiautomator and return XML.",
+    description: "Dump the current Android accessibility tree as XML through the persistent on-device UIAutomator bridge.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: async (input) => {
       optionalObject(input);
@@ -643,8 +891,17 @@ const tools: ToolDefinition[] = [
     }
   },
   {
+    name: "android_dump_compact",
+    description: "Return a compact accessibility-node list from the persistent on-device UIAutomator bridge.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: async (input) => {
+      optionalObject(input);
+      return androidDumpCompact();
+    }
+  },
+  {
     name: "android_tap",
-    description: "Tap a screen coordinate using adb shell input tap.",
+    description: "Tap a screen coordinate through the persistent on-device UIAutomator bridge.",
     inputSchema: {
       type: "object",
       required: ["x", "y"],
@@ -655,7 +912,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_swipe",
-    description: "Swipe between two screen coordinates using adb shell input swipe.",
+    description: "Swipe between two screen coordinates through the persistent on-device UIAutomator bridge.",
     inputSchema: {
       type: "object",
       required: ["x1", "y1", "x2", "y2"],
@@ -664,7 +921,8 @@ const tools: ToolDefinition[] = [
         y1: integerSchema,
         x2: integerSchema,
         y2: integerSchema,
-        durationMs: { ...integerSchema, default: 300 }
+        durationMs: { ...integerSchema, default: 300 },
+        steps: { ...positiveIntegerSchema, description: "Optional UIAutomator swipe steps. Defaults to durationMs / 5." }
       },
       additionalProperties: false
     },
@@ -672,18 +930,54 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_input_text",
-    description: "Input text using adb shell input text. Spaces are encoded as %s.",
+    description: "Input text into the focused field with adb shell input text, or edit a matching node by selector with accessibility set_text.",
     inputSchema: {
       type: "object",
       required: ["text"],
-      properties: { text: { type: "string", minLength: 1 } },
+      properties: {
+        text: { type: "string", minLength: 1 },
+        selector: selectorSchema,
+        pressEnter: { type: "boolean", default: false }
+      },
       additionalProperties: false
     },
     handler: androidInputText
   },
   {
+    name: "android_perform_action",
+    description: "Execute an accessibility action on a matching node selected by text, content description, resource ID, class name, or bounds.",
+    inputSchema: {
+      type: "object",
+      required: ["action", "selector"],
+      properties: {
+        action: {
+          type: "string",
+          enum: ["click", "long_click", "scroll_forward", "scroll_backward", "expand", "collapse", "dismiss", "set_selection", "set_text"]
+        },
+        selector: selectorSchema
+      },
+      additionalProperties: false
+    },
+    handler: androidPerformAction
+  },
+  {
+    name: "android_long_press",
+    description: "Long press a screen coordinate through adb by holding the touch at that point.",
+    inputSchema: {
+      type: "object",
+      required: ["x", "y"],
+      properties: {
+        x: integerSchema,
+        y: integerSchema,
+        durationMs: { ...integerSchema, default: 650 }
+      },
+      additionalProperties: false
+    },
+    handler: androidLongPress
+  },
+  {
     name: "android_key",
-    description: "Send one supported Android key event.",
+    description: "Send one supported Android key event through the persistent on-device UIAutomator bridge.",
     inputSchema: {
       type: "object",
       required: ["key"],
@@ -790,7 +1084,7 @@ async function handleToolCall(id: JsonRpcId | undefined, params: unknown): Promi
     });
   } catch (error) {
     const err = error as Error;
-    const data = error instanceof AdbCommandError ? error.details : undefined;
+    const data = error instanceof AdbCommandError || error instanceof AndroidBridgeError ? error.details : undefined;
     sendResponse(id, {
       isError: true,
       content: [{ type: "text", text: JSON.stringify({ error: err.message, data }, null, 2) }]

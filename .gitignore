@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.gradle/
+build/
 android-server/build/
 .DS_Store
 *.log

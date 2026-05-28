@@ -1,23 +1,39 @@
 # Protocol
 
-## Phase 1
+## MCP
 
 The desktop MCP server exposes standard MCP `tools/list` and `tools/call` over stdio. Tool results are returned as JSON text content.
 
-## Phase 2 Preview
+Bridge-backed MCP tools:
 
-The Android persistent server will use newline-delimited JSON over an adb-forwarded socket.
+- `android_bridge_ping`
+- `android_bridge_exit`
+- `android_dump_tree`
+- `android_dump_compact`
+- `android_tap`
+- `android_swipe`
+- `android_key`
+- `android_perform_action`
+
+ADB-backed MCP tools:
+
+- `android_screenshot`
+- `android_input_text`
+- `android_long_press`
+- `android_list_apps`
+- `android_launch_app`
+
+## Android Bridge
+
+The Android persistent server uses newline-delimited JSON over an adb-forwarded socket.
 
 Request:
 
 ```json
 {
-  "id": 1,
   "method": "tap",
-  "params": {
-    "x": 540,
-    "y": 1200
-  }
+  "x": 540,
+  "y": 1200
 }
 ```
 
@@ -25,7 +41,7 @@ Response:
 
 ```json
 {
-  "id": 1,
+  "ok": true,
   "success": true
 }
 ```

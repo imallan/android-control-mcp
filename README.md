@@ -2,18 +2,25 @@
 
 Android UI automation bridge for MCP.
 
-This repository currently implements the Phase 1 MVP from `android-ui-mcp-bridge-implementation-plan.md`: a desktop MCP server that calls local `adb` commands for screenshots, accessibility tree dumps, taps, swipes, text input, and key events.
+This repository implements an Android UI MCP bridge. The desktop MCP server exposes tools over MCP stdio and delegates UIAutomator operations to a persistent on-device bridge started with `uiautomator runtest`.
 
 ## Layout
 
 ```text
-android-server/   Phase 2 placeholder for the Android shell process server
-desktop-mcp/      Phase 1 TypeScript MCP stdio server
+android-server/   Kotlin UIAutomator process server
+desktop-mcp/      TypeScript MCP stdio server
 docs/             Architecture, protocol, and compatibility notes
 scripts/          Helper scripts
 ```
 
-## Run the MVP
+## Run
+
+```sh
+android-server/scripts/build-uiautomator-jar.sh
+android-server/scripts/start-uiautomator-server.sh
+```
+
+In another terminal:
 
 ```sh
 cd desktop-mcp
@@ -27,4 +34,4 @@ Requirements:
 - `adb` available on `PATH`
 - One authorized Android device, or `ANDROID_SERIAL` set
 
-The MVP has no npm dependencies; it runs directly on Node 24's TypeScript support.
+The MCP server has no npm dependencies; it runs directly on Node 24's TypeScript support.

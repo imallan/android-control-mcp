@@ -19,16 +19,24 @@ commands over `localabstract:android-ui-mcp`.
 android-server/scripts/build-uiautomator-jar.sh
 ```
 
-The script uses the local Android SDK directly, without Gradle:
+The script delegates to the repository Gradle wrapper:
+
+```sh
+./gradlew :android-server:buildUiautomatorJar
+```
+
+The Gradle task still uses the local Android SDK directly:
 
 - `platforms/android-36/android.jar`
 - `platforms/android-36/uiautomator.jar`
 - `build-tools/37.0.0/d8`
+- Android Studio's bundled Kotlin compiler by default:
+  `/Applications/Android Studio.app/Contents/plugins/Kotlin/kotlinc/bin/kotlinc`
 
 Override with:
 
 ```sh
-ANDROID_SDK_ROOT=/path/to/sdk ANDROID_PLATFORM=android-36.1 ANDROID_BUILD_TOOLS=36.1.0 \
+ANDROID_SDK_ROOT=/path/to/sdk ANDROID_PLATFORM=android-36.1 ANDROID_BUILD_TOOLS=36.1.0 KOTLINC=/path/to/kotlinc \
   android-server/scripts/build-uiautomator-jar.sh
 ```
 
@@ -59,6 +67,8 @@ node android-server/client/rpc.mjs dumpCompact
 node android-server/client/rpc.mjs swipe x1=720 y1=2600 x2=720 y2=850 steps=24
 node android-server/client/rpc.mjs tap x=720 y=1200
 node android-server/client/rpc.mjs key key=BACK
+node android-server/client/rpc.mjs inputText text=Promotion targetText=Search
+node android-server/client/rpc.mjs performAction action=long_click targetText=Search
 ```
 
 Responses include Android-side `elapsedMs` and the client-side `hostElapsedMs`.
@@ -94,6 +104,8 @@ Supported methods:
 - `dumpCompact`
 - `dumpXml`
 - `tap`
+- `inputText`
+- `performAction`
 - `swipe`
 - `key`
 - `exit`
