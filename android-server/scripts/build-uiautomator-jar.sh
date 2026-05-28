@@ -3,4 +3,4 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 
-exec "$ROOT_DIR/gradlew" :android-server:buildUiautomatorJar "$@"
+exec "$ROOT_DIR/gradlew" clean :android-server:buildUiautomatorJar "$@"

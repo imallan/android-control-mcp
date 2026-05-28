@@ -1,4 +1,5 @@
 import org.gradle.api.GradleException
+import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Exec
 
 val sdkRoot: String =
@@ -35,6 +36,12 @@ val classesDir = layout.buildDirectory.dir("classes")
 val dexDir = layout.buildDirectory.dir("dex")
 val rawJar = layout.buildDirectory.file("android-ui-server-classes.jar")
 val finalJar = layout.buildDirectory.file("android-ui-server.jar")
+
+tasks.register<Delete>("clean") {
+  group = "build"
+  description = "Deletes Android UIAutomator server build outputs."
+  delete(layout.buildDirectory)
+}
 
 fun requireFile(path: File, label: String) {
   if (!path.exists()) {
