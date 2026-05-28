@@ -67,6 +67,8 @@ node android-server/client/rpc.mjs dumpCompact
 node android-server/client/rpc.mjs swipe x1=720 y1=2600 x2=720 y2=850 steps=24
 node android-server/client/rpc.mjs tap x=720 y=1200
 node android-server/client/rpc.mjs key key=BACK
+node android-server/client/rpc.mjs inputText text=Promotion targetText=Search
+node android-server/client/rpc.mjs performAction action=long_click targetText=Search
 ```
 
 Responses include Android-side `elapsedMs` and the client-side `hostElapsedMs`.
@@ -102,6 +104,8 @@ Supported methods:
 - `dumpCompact`
 - `dumpXml`
 - `tap`
+- `inputText`
+- `performAction`
 - `swipe`
 - `key`
 - `exit`

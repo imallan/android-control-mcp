@@ -28,6 +28,15 @@ type AndroidApp = {
   aliases: string[];
 };
 
+type NodeSelector = {
+  text?: string;
+  contentDesc?: string;
+  resourceId?: string;
+  className?: string;
+  bounds?: string;
+  occurrence?: number;
+};
+
 type ToolDefinition = {
   name: string;
   description: string;
@@ -315,6 +324,53 @@ function optionalBooleanParam(input: Record<string, unknown>, name: string, defa
   return value;
 }
 
+function optionalSelectorParam(input: Record<string, unknown>, name: string): NodeSelector | undefined {
+  const value = input[name];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const selector = expectObject(value);
+  const occurrenceValue = selector.occurrence;
+  if (occurrenceValue !== undefined && (!Number.isInteger(occurrenceValue) || (occurrenceValue as number) < 1)) {
+    throw new ToolInputError("selector.occurrence must be a positive integer when provided.");
+  }
+  return {
+    text: optionalStringParam(selector, "text"),
+    contentDesc: optionalStringParam(selector, "contentDesc"),
+    resourceId: optionalStringParam(selector, "resourceId"),
+    className: optionalStringParam(selector, "className"),
+    bounds: optionalStringParam(selector, "bounds"),
+    occurrence: occurrenceValue as number | undefined
+  };
+}
+
+function selectorHasAnyField(selector: NodeSelector): boolean {
+  return Boolean(selector.text || selector.contentDesc || selector.resourceId || selector.className || selector.bounds);
+}
+
+function flattenSelector(selector: NodeSelector): Record<string, string | number> {
+  const params: Record<string, string | number> = {};
+  if (selector.text !== undefined) {
+    params.targetText = selector.text;
+  }
+  if (selector.contentDesc !== undefined) {
+    params.targetContentDesc = selector.contentDesc;
+  }
+  if (selector.resourceId !== undefined) {
+    params.targetResourceId = selector.resourceId;
+  }
+  if (selector.className !== undefined) {
+    params.targetClassName = selector.className;
+  }
+  if (selector.bounds !== undefined) {
+    params.targetBounds = selector.bounds;
+  }
+  if (selector.occurrence !== undefined) {
+    params.targetOccurrence = selector.occurrence;
+  }
+  return params;
+}
+
 function parsePngSize(png: Buffer): { width: number; height: number } {
   const signature = "89504e470d0a1a0a";
   if (png.subarray(0, 8).toString("hex") !== signature) {
@@ -391,9 +447,50 @@ async function androidSwipe(input: unknown): Promise<ToolResult> {
 async function androidInputText(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const text = stringParam(params, "text");
+  const selector = optionalSelectorParam(params, "selector");
+  const pressEnter = optionalBooleanParam(params, "pressEnter", false);
+
+  if (selector && selectorHasAnyField(selector)) {
+    const response = await androidBridgeRpc("inputText", {
+      text,
+      ...flattenSelector(selector)
+    });
+    const result = normalizeBridgeSuccess(response);
+    if (pressEnter) {
+      await androidBridgeRpc("key", { key: "ENTER" });
+    }
+    return result;
+  }
+
   const encoded = encodeAndroidInputText(text);
-  await adbText(["shell", `input text ${shellQuote(encoded)}`]);
-  return { success: true };
+  await adbText(["shell", "input", "text", encoded]);
+  if (pressEnter) {
+    await androidBridgeRpc("key", { key: "ENTER" });
+  }
+  return { success: true, text };
+}
+
+async function androidPerformAction(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const action = stringParam(params, "action");
+  const selector = optionalSelectorParam(params, "selector");
+  if (!selector || !selectorHasAnyField(selector)) {
+    throw new ToolInputError("selector is required and must identify a node.");
+  }
+  const response = await androidBridgeRpc("performAction", {
+    action,
+    ...flattenSelector(selector)
+  });
+  return normalizeBridgeSuccess(response);
+}
+
+async function androidLongPress(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const x = numberParam(params, "x");
+  const y = numberParam(params, "y");
+  const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
+  await adbText(["shell", "input", "swipe", String(x), String(y), String(x), String(y), String(durationMs)]);
+  return { success: true, x, y, durationMs };
 }
 
 async function androidKey(input: unknown): Promise<ToolResult> {
@@ -742,6 +839,18 @@ function titleCase(value: string): string {
 
 const integerSchema = { type: "integer", minimum: 0 };
 const positiveIntegerSchema = { type: "integer", minimum: 1 };
+const selectorSchema = {
+  type: "object",
+  properties: {
+    text: { type: "string", minLength: 1 },
+    contentDesc: { type: "string", minLength: 1 },
+    resourceId: { type: "string", minLength: 1 },
+    className: { type: "string", minLength: 1 },
+    bounds: { type: "string", minLength: 1 },
+    occurrence: { type: "integer", minimum: 1, default: 1 }
+  },
+  additionalProperties: false
+};
 
 const tools: ToolDefinition[] = [
   {
@@ -821,14 +930,50 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_input_text",
-    description: "Input text using adb shell input text. Spaces are encoded as %s.",
+    description: "Input text into the focused field with adb shell input text, or edit a matching node by selector with accessibility set_text.",
     inputSchema: {
       type: "object",
       required: ["text"],
-      properties: { text: { type: "string", minLength: 1 } },
+      properties: {
+        text: { type: "string", minLength: 1 },
+        selector: selectorSchema,
+        pressEnter: { type: "boolean", default: false }
+      },
       additionalProperties: false
     },
     handler: androidInputText
+  },
+  {
+    name: "android_perform_action",
+    description: "Execute an accessibility action on a matching node selected by text, content description, resource ID, class name, or bounds.",
+    inputSchema: {
+      type: "object",
+      required: ["action", "selector"],
+      properties: {
+        action: {
+          type: "string",
+          enum: ["click", "long_click", "scroll_forward", "scroll_backward", "expand", "collapse", "dismiss", "set_selection", "set_text"]
+        },
+        selector: selectorSchema
+      },
+      additionalProperties: false
+    },
+    handler: androidPerformAction
+  },
+  {
+    name: "android_long_press",
+    description: "Long press a screen coordinate through adb by holding the touch at that point.",
+    inputSchema: {
+      type: "object",
+      required: ["x", "y"],
+      properties: {
+        x: integerSchema,
+        y: integerSchema,
+        durationMs: { ...integerSchema, default: 650 }
+      },
+      additionalProperties: false
+    },
+    handler: androidLongPress
   },
   {
     name: "android_key",

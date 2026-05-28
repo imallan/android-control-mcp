@@ -6,6 +6,7 @@ import android.graphics.Rect
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.os.SystemClock
+import android.os.Bundle
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
@@ -82,6 +83,8 @@ class BridgeTest : UiAutomatorTestCase() {
       "dumpCompact" -> dumpCompact()
       "dumpXml" -> dumpXml()
       "tap" -> bool("success", device.click(intParam(request, "x"), intParam(request, "y")))
+      "inputText" -> inputText(request)
+      "performAction" -> performAction(request)
       "swipe" -> {
         val success =
           device.swipe(
@@ -176,9 +179,183 @@ class BridgeTest : UiAutomatorTestCase() {
     return builder.toString()
   }
 
+  @Throws(Exception::class)
+  private fun inputText(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val text = request["text"] ?: throw IllegalArgumentException("missing text")
+    val selector = selectorFromRequest(request)
+    if (!selector.hasAnyField()) {
+      throw IllegalArgumentException("inputText requires a target selector when used inside the bridge")
+    }
+
+    val success = performOnMatchingNode(selector) { node ->
+      val arguments = Bundle()
+      arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+      if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
+        throw IllegalStateException("selected node rejected set_text")
+      }
+    }
+    if (!success) {
+      throw IllegalArgumentException("no accessibility node matched the provided selector")
+    }
+
+    device.waitForIdle(500)
+    return linkedMapOf("ok" to true, "success" to true, "text" to text)
+  }
+
+  @Throws(Exception::class)
+  private fun performAction(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val actionName = request["action"] ?: throw IllegalArgumentException("missing action")
+    val selector = selectorFromRequest(request)
+    if (!selector.hasAnyField()) {
+      throw IllegalArgumentException("performAction requires a target selector")
+    }
+
+    val actionId = actionId(actionName)
+      ?: throw IllegalArgumentException("unknown action: $actionName")
+
+    val success =
+      performOnMatchingNode(selector) { node ->
+        val customAction = resolveCustomAction(node, actionName)
+        val performed = if (customAction != null) {
+          node.performAction(customAction.id)
+        } else if (actionId == AccessibilityNodeInfo.ACTION_SET_TEXT) {
+          val text = request["text"] ?: ""
+          val arguments = Bundle()
+          arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+          node.performAction(actionId, arguments)
+        } else {
+          node.performAction(actionId)
+        }
+        if (!performed) {
+          throw IllegalStateException("selected node rejected $actionName")
+        }
+      }
+    if (!success) {
+      throw IllegalArgumentException("no accessibility node matched the provided selector")
+    }
+
+    device.waitForIdle(500)
+    return linkedMapOf("ok" to true, "success" to true, "action" to actionLabel(actionId, request["action"]))
+  }
+
+  @Throws(Exception::class)
+  private fun performOnMatchingNode(selector: NodeSelector, onMatch: (AccessibilityNodeInfo) -> Unit): Boolean {
+    val roots = rootNodes()
+    val state = MatchState()
+    for (root in roots) {
+      try {
+        if (traverseAndAct(root, selector, onMatch, state)) {
+          return true
+        }
+      } finally {
+        root.recycle()
+      }
+    }
+    return false
+  }
+
+  @Throws(Exception::class)
+  private fun traverseAndAct(
+    node: AccessibilityNodeInfo?,
+    selector: NodeSelector,
+    onMatch: (AccessibilityNodeInfo) -> Unit,
+    state: MatchState
+  ): Boolean {
+    if (node == null) {
+      return false
+    }
+
+    if (matchesSelector(node, selector)) {
+      state.seen += 1
+      if (state.seen == selector.occurrence) {
+        onMatch(node)
+        return true
+      }
+    }
+
+    val childCount = node.childCount
+    for (index in 0 until childCount) {
+      val child = node.getChild(index)
+      if (child != null) {
+        try {
+          if (traverseAndAct(child, selector, onMatch, state)) {
+            return true
+          }
+        } finally {
+          child.recycle()
+        }
+      }
+    }
+    return false
+  }
+
+  private fun selectorFromRequest(request: Map<String, String>): NodeSelector {
+    return NodeSelector(
+      text = request["targetText"],
+      contentDesc = request["targetContentDesc"],
+      resourceId = request["targetResourceId"],
+      className = request["targetClassName"],
+      bounds = request["targetBounds"],
+      occurrence = request["targetOccurrence"]?.toIntOrNull() ?: 1
+    )
+  }
+
+  private fun matchesSelector(node: AccessibilityNodeInfo, selector: NodeSelector): Boolean {
+    if (selector.text != null && node.text?.toString() != selector.text) {
+      return false
+    }
+    if (selector.contentDesc != null && node.contentDescription?.toString() != selector.contentDesc) {
+      return false
+    }
+    if (selector.resourceId != null && node.viewIdResourceName != selector.resourceId) {
+      return false
+    }
+    if (selector.className != null && node.className?.toString() != selector.className) {
+      return false
+    }
+    if (selector.bounds != null) {
+      val bounds = Rect()
+      node.getBoundsInScreen(bounds)
+      if (rectToString(bounds) != selector.bounds) {
+        return false
+      }
+    }
+    return true
+  }
+
+  private fun resolveCustomAction(
+    node: AccessibilityNodeInfo,
+    actionName: String
+  ): AccessibilityNodeInfo.AccessibilityAction? {
+    val requested = normalizeActionName(actionName)
+    for (action in node.actionList) {
+      val label = actionLabel(action.id, action.label?.toString()) ?: continue
+      val normalizedLabel = normalizeActionName(label)
+      if (normalizedLabel == requested || normalizedLabel.contains(requested) || requested.contains(normalizedLabel)) {
+        return action
+      }
+    }
+    return null
+  }
+
+  private data class MatchState(var seen: Int = 0)
+
   companion object {
     private const val SOCKET_NAME = "android-ui-mcp"
     private val DUMP_FILE = File("/sdcard/android-ui-mcp-window.xml")
+
+    private data class NodeSelector(
+      val text: String? = null,
+      val contentDesc: String? = null,
+      val resourceId: String? = null,
+      val className: String? = null,
+      val bounds: String? = null,
+      val occurrence: Int = 1
+    ) {
+      fun hasAnyField(): Boolean {
+        return text != null || contentDesc != null || resourceId != null || className != null || bounds != null
+      }
+    }
 
     private fun collectCompactNodes(node: AccessibilityNodeInfo?, out: MutableList<Any>, depth: Int) {
       if (node == null || depth > 80) {
@@ -201,6 +378,11 @@ class BridgeTest : UiAutomatorTestCase() {
         compact["bounds"] = rectToString(bounds)
         if (node.isClickable) compact["clickable"] = true
         if (node.isScrollable) compact["scrollable"] = true
+        val actions = node.actionList
+          .mapNotNull { action -> actionLabel(action.id, action.label?.toString()) }
+        if (actions.isNotEmpty()) {
+          compact["actions"] = actions
+        }
         out.add(compact)
       }
 
@@ -246,6 +428,43 @@ class BridgeTest : UiAutomatorTestCase() {
 
     private fun rectToString(rect: Rect): String {
       return "[${rect.left},${rect.top}][${rect.right},${rect.bottom}]"
+    }
+
+    private fun actionLabel(actionId: Int, label: String?): String? {
+      if (!label.isNullOrBlank()) {
+        return label
+      }
+      return when (actionId) {
+        AccessibilityNodeInfo.ACTION_CLICK -> "click"
+        AccessibilityNodeInfo.ACTION_LONG_CLICK -> "long_click"
+        AccessibilityNodeInfo.ACTION_SCROLL_FORWARD -> "scroll_forward"
+        AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD -> "scroll_backward"
+        AccessibilityNodeInfo.ACTION_EXPAND -> "expand"
+        AccessibilityNodeInfo.ACTION_COLLAPSE -> "collapse"
+        AccessibilityNodeInfo.ACTION_DISMISS -> "dismiss"
+        AccessibilityNodeInfo.ACTION_SET_SELECTION -> "set_selection"
+        AccessibilityNodeInfo.ACTION_SET_TEXT -> "set_text"
+        else -> null
+      }
+    }
+
+    private fun actionId(actionName: String): Int? {
+      return when (normalizeActionName(actionName)) {
+        "click" -> AccessibilityNodeInfo.ACTION_CLICK
+        "long_click" -> AccessibilityNodeInfo.ACTION_LONG_CLICK
+        "scroll_forward" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        "scroll_backward" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        "expand" -> AccessibilityNodeInfo.ACTION_EXPAND
+        "collapse" -> AccessibilityNodeInfo.ACTION_COLLAPSE
+        "dismiss" -> AccessibilityNodeInfo.ACTION_DISMISS
+        "set_selection" -> AccessibilityNodeInfo.ACTION_SET_SELECTION
+        "set_text" -> AccessibilityNodeInfo.ACTION_SET_TEXT
+        else -> null
+      }
+    }
+
+    private fun normalizeActionName(actionName: String): String {
+      return actionName.trim().lowercase().replace(' ', '_').replace('-', '_')
     }
 
     private fun ok(key: String, value: Any?): LinkedHashMap<String, Any?> {
