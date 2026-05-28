@@ -382,18 +382,6 @@ function parsePngSize(png: Buffer): { width: number; height: number } {
   };
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function encodeAndroidInputText(text: string): string {
-  return text
-    .replaceAll("%", "%25")
-    .replaceAll(" ", "%s")
-    .replaceAll("\n", "%n")
-    .replaceAll("\t", "%t");
-}
-
 async function androidScreenshot(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const retain = optionalBooleanParam(params, "retain", false);
@@ -462,12 +450,12 @@ async function androidInputText(input: unknown): Promise<ToolResult> {
     return result;
   }
 
-  const encoded = encodeAndroidInputText(text);
-  await adbText(["shell", "input", "text", encoded]);
+  const response = await androidBridgeRpc("inputText", { text });
+  const result = normalizeBridgeSuccess(response);
   if (pressEnter) {
     await androidBridgeRpc("key", { key: "ENTER" });
   }
-  return { success: true, text };
+  return result;
 }
 
 async function androidPerformAction(input: unknown): Promise<ToolResult> {
@@ -489,8 +477,9 @@ async function androidLongPress(input: unknown): Promise<ToolResult> {
   const x = numberParam(params, "x");
   const y = numberParam(params, "y");
   const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
-  await adbText(["shell", "input", "swipe", String(x), String(y), String(x), String(y), String(durationMs)]);
-  return { success: true, x, y, durationMs };
+  const steps = Math.max(1, Math.round(durationMs / 5));
+  const response = await androidBridgeRpc("longPress", { x, y, steps });
+  return normalizeBridgeSuccess({ ...response, durationMs, steps });
 }
 
 async function androidKey(input: unknown): Promise<ToolResult> {
@@ -962,7 +951,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_long_press",
-    description: "Long press a screen coordinate through adb by holding the touch at that point.",
+    description: "Long press a screen coordinate through the persistent on-device UIAutomator bridge.",
     inputSchema: {
       type: "object",
       required: ["x", "y"],

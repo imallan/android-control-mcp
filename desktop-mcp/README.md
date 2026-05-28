@@ -93,7 +93,7 @@ Restart or reload Codex after installation so it discovers the tools.
 ## Transport Notes
 
 - `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, and `android_key` require the persistent Android bridge.
-- `android_screenshot`, `android_input_text`, `android_list_apps`, and `android_launch_app` still use direct ADB commands because the Android bridge does not yet expose screenshot, text input, or package-manager methods.
+- `android_screenshot`, `android_list_apps`, and `android_launch_app` still use direct ADB commands because the Android bridge does not yet expose screenshot or package-manager methods.
 - The MCP server refreshes `adb forward tcp:$ANDROID_UI_MCP_PORT localabstract:android-ui-mcp` before each bridge call.
 
 ## Limitations

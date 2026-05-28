@@ -85,6 +85,7 @@ class BridgeTest : UiAutomatorTestCase() {
       "tap" -> bool("success", device.click(intParam(request, "x"), intParam(request, "y")))
       "inputText" -> inputText(request)
       "performAction" -> performAction(request)
+      "longPress" -> longPress(request)
       "swipe" -> {
         val success =
           device.swipe(
@@ -183,19 +184,18 @@ class BridgeTest : UiAutomatorTestCase() {
   private fun inputText(request: Map<String, String>): LinkedHashMap<String, Any?> {
     val text = request["text"] ?: throw IllegalArgumentException("missing text")
     val selector = selectorFromRequest(request)
-    if (!selector.hasAnyField()) {
-      throw IllegalArgumentException("inputText requires a target selector when used inside the bridge")
-    }
 
-    val success = performOnMatchingNode(selector) { node ->
-      val arguments = Bundle()
-      arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-      if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
-        throw IllegalStateException("selected node rejected set_text")
+    if (selector.hasAnyField()) {
+      val success = performOnMatchingNode(selector) { node ->
+        setNodeText(node, text, "selected node")
       }
-    }
-    if (!success) {
-      throw IllegalArgumentException("no accessibility node matched the provided selector")
+      if (!success) {
+        throw IllegalArgumentException("no accessibility node matched the provided selector")
+      }
+    } else {
+      performOnFocusedInput { node ->
+        setNodeText(node, text, "focused node")
+      }
     }
 
     device.waitForIdle(500)
@@ -236,6 +236,102 @@ class BridgeTest : UiAutomatorTestCase() {
 
     device.waitForIdle(500)
     return linkedMapOf("ok" to true, "success" to true, "action" to actionLabel(actionId, request["action"]))
+  }
+
+  @Throws(Exception::class)
+  private fun longPress(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val x = intParam(request, "x")
+    val y = intParam(request, "y")
+    val steps = intParam(request, "steps", 130)
+    val success = longTap(x, y) || device.swipe(x, y, x + 1, y + 1, steps)
+    device.waitForIdle(500)
+    return linkedMapOf("ok" to true, "success" to success, "x" to x, "y" to y, "steps" to steps)
+  }
+
+  private fun longTap(x: Int, y: Int): Boolean {
+    return try {
+      val bridge = invokeNoArg(device, "getAutomatorBridge") ?: return false
+      val controller =
+        try {
+          invokeNoArg(bridge, "getInteractionController")
+        } catch (_: Exception) {
+          readField(bridge, "mInteractionController")
+        } ?: return false
+      val method = controller.javaClass.getDeclaredMethod("longTapNoSync", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+      method.isAccessible = true
+      method.invoke(controller, x, y) as? Boolean ?: false
+    } catch (_: Exception) {
+      false
+    }
+  }
+
+  private fun setNodeText(node: AccessibilityNodeInfo, text: String, label: String) {
+    val arguments = Bundle()
+    arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+    if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
+      throw IllegalStateException("$label rejected set_text")
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun performOnFocusedInput(onFocus: (AccessibilityNodeInfo) -> Unit) {
+    val roots = rootNodes()
+    for (root in roots) {
+      try {
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null && supportsSetText(focused)) {
+          try {
+            onFocus(focused)
+            return
+          } finally {
+            focused.recycle()
+          }
+        }
+        focused?.recycle()
+
+        val focusedEditable = findFocusedEditable(root)
+        if (focusedEditable != null) {
+          try {
+            onFocus(focusedEditable)
+            return
+          } finally {
+            focusedEditable.recycle()
+          }
+        }
+      } finally {
+        root.recycle()
+      }
+    }
+    throw IllegalArgumentException("no focused input node found")
+  }
+
+  private fun findFocusedEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+    if (node == null) {
+      return null
+    }
+    if (node.isFocused && supportsSetText(node)) {
+      return AccessibilityNodeInfo.obtain(node)
+    }
+
+    val childCount = node.childCount
+    for (index in 0 until childCount) {
+      val child = node.getChild(index)
+      if (child != null) {
+        try {
+          val match = findFocusedEditable(child)
+          if (match != null) {
+            return match
+          }
+        } finally {
+          child.recycle()
+        }
+      }
+    }
+    return null
+  }
+
+  private fun supportsSetText(node: AccessibilityNodeInfo): Boolean {
+    return node.actionList.any { action -> action.id == AccessibilityNodeInfo.ACTION_SET_TEXT }
   }
 
   @Throws(Exception::class)

@@ -14,12 +14,11 @@ Bridge-backed MCP tools:
 - `android_swipe`
 - `android_key`
 - `android_perform_action`
+- `android_long_press`
 
 ADB-backed MCP tools:
 
 - `android_screenshot`
-- `android_input_text`
-- `android_long_press`
 - `android_list_apps`
 - `android_launch_app`
 
