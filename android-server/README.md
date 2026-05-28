@@ -57,6 +57,10 @@ adb shell uiautomator runtest /data/local/tmp/android-ui-server.jar \
   -c com.example.androiduiserver.BridgeTest#testServe
 ```
 
+When the test process starts, it acquires a screen wake lock and wakes the device so the
+screen stays on for the lifetime of the bridge process. The lock is released when the
+process exits.
+
 ## Try RPC
 
 In another terminal:

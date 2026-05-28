@@ -15,12 +15,12 @@ Bridge-backed MCP tools:
 - `android_key`
 - `android_perform_action`
 - `android_long_press`
+- `android_list_apps`
+- `android_launch_app`
 
 ADB-backed MCP tools:
 
 - `android_screenshot`
-- `android_list_apps`
-- `android_launch_app`
 
 ## Android Bridge
 

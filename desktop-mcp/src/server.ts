@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -24,7 +24,7 @@ type AndroidApp = {
   activityName: string;
   componentName: string;
   name: string;
-  labelSource: "aapt" | "derived";
+  labelSource: "packageManager" | "derived";
   aliases: string[];
 };
 
@@ -46,7 +46,6 @@ type ToolDefinition = {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_ADB_TIMEOUT_MS ?? 15_000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_SCREENSHOT_TIMEOUT_MS ?? 20_000);
-const APP_LIST_TIMEOUT_MS = Number(process.env.ANDROID_MCP_APP_LIST_TIMEOUT_MS ?? 60_000);
 const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
@@ -115,15 +114,6 @@ async function adbText(args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<
   } catch (error) {
     throw normalizeAdbError(args, error);
   }
-}
-
-async function execText(command: string, args: string[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string> {
-  const { stdout } = await execFileAsync(command, args, {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 16 * 1024 * 1024
-  });
-  return stdout;
 }
 
 async function androidBridgeRpc(method: string, params: Record<string, string | number | boolean> = {}): Promise<Record<string, unknown>> {
@@ -514,8 +504,8 @@ async function androidListApps(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const query = optionalStringParam(params, "query");
   const includeSystem = optionalBooleanParam(params, "includeSystem", true);
-  const resolveLabels = optionalBooleanParam(params, "resolveLabels", false);
-  const apps = await getLauncherApps(resolveLabels);
+  optionalBooleanParam(params, "resolveLabels", false);
+  const apps = await getLauncherApps();
   const filtered = apps.filter((app) => {
     if (!includeSystem && !isLikelyUserApp(app.applicationId)) {
       return false;
@@ -531,7 +521,7 @@ async function androidListApps(input: unknown): Promise<ToolResult> {
     apps: filtered,
     count: filtered.length,
     localizationNote:
-      "Fast app names are derived from package/activity names. Set resolveLabels=true to parse APK labels with local aapt; labels may differ by device locale. Use applicationId for deterministic launching."
+      "App names are derived on the Android device from package and launcher activity names. Use applicationId for deterministic launching."
   };
 }
 
@@ -540,7 +530,7 @@ async function androidLaunchApp(input: unknown): Promise<ToolResult> {
   const applicationId = optionalStringParam(params, "applicationId");
   const appName = optionalStringParam(params, "appName");
   const allowSubstring = optionalBooleanParam(params, "allowSubstring", true);
-  const resolveLabels = optionalBooleanParam(params, "resolveLabels", true);
+  optionalBooleanParam(params, "resolveLabels", true);
 
   if (!applicationId && !appName) {
     throw new ToolInputError("Provide applicationId or appName.");
@@ -549,27 +539,23 @@ async function androidLaunchApp(input: unknown): Promise<ToolResult> {
     throw new ToolInputError("Provide only one of applicationId or appName.");
   }
 
-  const apps = await getLauncherApps(false);
+  const apps = await getLauncherApps();
   let target = applicationId ? findAppByApplicationId(apps, applicationId) : findAppByName(apps, appName as string, allowSubstring, false);
-  if (!applicationId && target === undefined && resolveLabels) {
-    target = findAppByName(await getLauncherApps(true), appName as string, allowSubstring, true);
-  }
   if (!target) {
     throw new ToolInputError(
-      `No launcher app matched appName '${appName}'. App-name matching is localization-sensitive; call android_list_apps with resolveLabels=true, then launch by applicationId.`
+      `No launcher app matched appName '${appName}'. Call android_list_apps, then launch by applicationId.`
     );
   }
-  await adbText(["shell", "monkey", "-p", target.applicationId, "-c", "android.intent.category.LAUNCHER", "1"]);
+  const response = await androidBridgeRpc("launchApp", { applicationId: target.applicationId });
+  const result = normalizeBridgeSuccess(response);
 
   return {
-    success: true,
-    launched: target,
+    ...result,
+    launched: (result.launched as AndroidApp | undefined) ?? target,
     localizationNote:
       appName === undefined
         ? undefined
-        : target.labelSource === "aapt"
-          ? "Name launch matched APK labels parsed on this machine. If localization causes a mismatch, call android_list_apps and launch by applicationId."
-          : "Name launch matched fast package/activity-derived aliases, not a localized launcher label. If localization matters, call android_list_apps with resolveLabels=true, then launch by applicationId."
+        : "Name launch matched package/activity-derived aliases from the Android device. If localization matters, call android_list_apps and launch by applicationId."
   };
 }
 
@@ -609,7 +595,7 @@ function findAppByName(apps: AndroidApp[], appName: string, allowSubstring: bool
     return undefined;
   }
   throw new ToolInputError(
-    `No launcher app matched appName '${appName}'. App-name matching depends on localized APK labels; call android_list_apps and launch by applicationId. Candidates: ${JSON.stringify(candidates)}`
+    `No launcher app matched appName '${appName}'. App-name matching uses package/activity-derived aliases from the Android device; call android_list_apps and launch by applicationId. Candidates: ${JSON.stringify(candidates)}`
   );
 }
 
@@ -660,170 +646,26 @@ function isLikelyUserApp(applicationId: string): boolean {
   );
 }
 
-async function getLauncherApps(resolveLabels: boolean): Promise<AndroidApp[]> {
-  const output = await adbText(
-    ["shell", "cmd", "package", "query-activities", "--brief", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"],
-    APP_LIST_TIMEOUT_MS
-  );
-  const components = parseLauncherComponents(output);
-  const apps = await Promise.all(components.map((component) => buildAndroidApp(component, resolveLabels)));
-  return apps.sort((a, b) => a.name.localeCompare(b.name) || a.applicationId.localeCompare(b.applicationId));
-}
-
-function parseLauncherComponents(output: string): Array<{ applicationId: string; activityName: string; componentName: string }> {
-  const components: Array<{ applicationId: string; activityName: string; componentName: string }> = [];
-  for (const line of output.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed.includes("/") || trimmed.startsWith("Activity #")) {
-      continue;
-    }
-    const [applicationId, rawActivityName] = trimmed.split("/", 2);
-    if (!applicationId || !rawActivityName || applicationId.includes(" ") || rawActivityName.includes(" ")) {
-      continue;
-    }
-    const activityName = rawActivityName.startsWith(".") ? `${applicationId}${rawActivityName}` : rawActivityName;
-    components.push({
-      applicationId,
-      activityName,
-      componentName: `${applicationId}/${rawActivityName}`
-    });
+async function getLauncherApps(): Promise<AndroidApp[]> {
+  const response = await androidBridgeRpc("listApps");
+  const apps = response.apps;
+  if (!Array.isArray(apps)) {
+    throw new AndroidBridgeError("Android bridge listApps response did not include apps.", { response });
   }
-  return components;
+  return apps.map(normalizeAndroidApp).sort((a, b) => a.name.localeCompare(b.name) || a.applicationId.localeCompare(b.applicationId));
 }
 
-async function buildAndroidApp(component: { applicationId: string; activityName: string; componentName: string }, resolveLabel: boolean): Promise<AndroidApp> {
-  const label = resolveLabel ? await readApkLabel(component.applicationId) : undefined;
-  const derivedName = deriveAppName(component.applicationId, component.activityName);
-  const name = label ?? derivedName;
+function normalizeAndroidApp(value: unknown): AndroidApp {
+  const app = expectObject(value);
+  const aliases = app.aliases;
   return {
-    ...component,
-    name,
-    labelSource: label ? "aapt" : "derived",
-    aliases: Array.from(
-      new Set([
-        derivedName,
-        lastPackageSegment(component.applicationId),
-        lastClassSegment(component.activityName),
-        camelToWords(lastClassSegment(component.activityName)),
-        component.applicationId
-      ])
-    )
+    applicationId: stringParam(app, "applicationId"),
+    activityName: stringParam(app, "activityName"),
+    componentName: stringParam(app, "componentName"),
+    name: stringParam(app, "name"),
+    labelSource: stringParam(app, "labelSource") as AndroidApp["labelSource"],
+    aliases: Array.isArray(aliases) ? aliases.filter((alias): alias is string => typeof alias === "string") : []
   };
-}
-
-async function readApkLabel(applicationId: string): Promise<string | undefined> {
-  try {
-    const aapt = await findAapt();
-    if (!aapt) {
-      return undefined;
-    }
-    const pathOutput = await adbText(["shell", "pm", "path", applicationId]);
-    const apkPath = pathOutput
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => line.startsWith("package:") && line.endsWith(".apk"))
-      ?.replace(/^package:/, "");
-    if (!apkPath) {
-      return undefined;
-    }
-    const apk = await adbBuffer(["exec-out", "cat", apkPath], APP_LIST_TIMEOUT_MS);
-    const dir = await mkdtemp(join(tmpdir(), "android-ui-mcp-apk-"));
-    const apkFile = join(dir, `${applicationId.replaceAll(".", "_")}.apk`);
-    await writeFile(apkFile, apk);
-    try {
-      const badging = await execText(aapt, ["dump", "badging", apkFile], APP_LIST_TIMEOUT_MS);
-      return parseAaptLabel(badging);
-    } finally {
-      await unlink(apkFile).catch(() => undefined);
-    }
-  } catch {
-    return undefined;
-  }
-}
-
-function parseAaptLabel(badging: string): string | undefined {
-  const preferred = badging.match(/^application-label:'([^']+)'$/m)?.[1];
-  if (preferred) {
-    return preferred;
-  }
-  return badging.match(/^application-label-[^:]+:'([^']+)'$/m)?.[1];
-}
-
-let cachedAaptPath: string | undefined | null;
-
-async function findAapt(): Promise<string | undefined> {
-  if (cachedAaptPath !== undefined) {
-    return cachedAaptPath ?? undefined;
-  }
-
-  const explicit = process.env.AAPT_PATH;
-  if (explicit) {
-    cachedAaptPath = explicit;
-    return explicit;
-  }
-
-  for (const sdkRoot of sdkRootCandidates()) {
-    try {
-      const buildTools = join(sdkRoot, "build-tools");
-      const versions = (await readdir(buildTools, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .sort(compareVersionsDesc);
-      if (versions.length > 0) {
-        cachedAaptPath = join(buildTools, versions[0], "aapt");
-        return cachedAaptPath;
-      }
-    } catch {
-      // Try the next SDK root candidate.
-    }
-  }
-
-  cachedAaptPath = null;
-  return undefined;
-}
-
-function sdkRootCandidates(): string[] {
-  const candidates = [
-    process.env.ANDROID_HOME,
-    process.env.ANDROID_SDK_ROOT,
-    "/Volumes/数据/Android/sdk",
-    join(process.env.HOME ?? "", "Library", "Android", "sdk")
-  ];
-  return candidates.filter((candidate): candidate is string => Boolean(candidate));
-}
-
-function compareVersionsDesc(a: string, b: string): number {
-  return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
-}
-
-function deriveAppName(applicationId: string, activityName: string): string {
-  const activityWords = camelToWords(lastClassSegment(activityName))
-    .split(/\s+/)
-    .filter((word) => !["Activity", "Launcher", "Main", "Home", "Shell", "List", "Conversation"].includes(word));
-  if (activityWords.length > 0 && activityWords.length <= 3) {
-    return activityWords.join(" ");
-  }
-  return titleCase(lastPackageSegment(applicationId).replace(/[_-]+/g, " "));
-}
-
-function lastPackageSegment(applicationId: string): string {
-  return applicationId.split(".").filter(Boolean).at(-1) ?? applicationId;
-}
-
-function lastClassSegment(activityName: string): string {
-  return activityName.split(".").filter(Boolean).at(-1)?.replace(/\$.*$/, "") ?? activityName;
-}
-
-function camelToWords(value: string): string {
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function titleCase(value: string): string {
-  return value.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 const integerSchema = { type: "integer", minimum: 0 };

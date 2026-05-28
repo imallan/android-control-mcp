@@ -12,7 +12,7 @@ on-device bridge, exposed over MCP stdio:
 - `android_swipe`
 - `android_input_text`
 - `android_key`
-- `android_list_apps`: list launcher apps; pass `resolveLabels=true` to parse APK labels when needed
+- `android_list_apps`: list launcher apps through the Android bridge
 - `android_launch_app`: launch by `applicationId`, or by a unique `appName` match
 
 ## Requirements
@@ -44,11 +44,9 @@ Optional environment variables:
 - `ANDROID_SERIAL`: target device serial
 - `ANDROID_MCP_ADB_TIMEOUT_MS`: default ADB command timeout, default `15000`
 - `ANDROID_MCP_SCREENSHOT_TIMEOUT_MS`: screenshot timeout, default `20000`
-- `ANDROID_MCP_APP_LIST_TIMEOUT_MS`: app listing timeout, default `60000`
 - `ANDROID_UI_MCP_HOST`: bridge host, default `127.0.0.1`
 - `ANDROID_UI_MCP_PORT`: bridge/adb-forward port, default `27183`
 - `ANDROID_UI_MCP_TIMEOUT_MS`: bridge request timeout, default `15000`
-- `AAPT_PATH`: optional path to Android SDK `aapt` for APK label parsing
 
 ## MCP Client Configuration
 
@@ -93,13 +91,13 @@ Restart or reload Codex after installation so it discovers the tools.
 ## Transport Notes
 
 - `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, and `android_key` require the persistent Android bridge.
-- `android_screenshot`, `android_list_apps`, and `android_launch_app` still use direct ADB commands because the Android bridge does not yet expose screenshot or package-manager methods.
+- `android_screenshot` still uses direct ADB because the Android bridge does not yet expose screenshot capture.
 - The MCP server refreshes `adb forward tcp:$ANDROID_UI_MCP_PORT localabstract:android-ui-mcp` before each bridge call.
 
 ## Limitations
 
 - `android_screenshot` writes `/tmp/android-ui-mcp/current-screen.png` by default. Use `retain=true` only when you want historical screenshots.
 - `adb shell input text` has limited Unicode support on some Android builds.
-- App-name launch is localization-sensitive. Fast matching uses package/activity-derived aliases; pass `resolveLabels=true` to allow APK label parsing with local `aapt`. `applicationId` launch is deterministic.
+- App-name launch uses package/activity-derived aliases. `applicationId` launch is deterministic.
 - `FLAG_SECURE` apps can return black screenshots.
 - WebView, OpenGL, and game screens may expose little or no accessibility tree.
