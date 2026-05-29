@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -25,17 +26,21 @@ type OcrMode = "auto" | "force" | "off";
 
 type SemanticNode = {
   id: string;
+  ref?: string;
   text?: string;
   contentDesc?: string;
   resourceId?: string;
   className?: string;
+  role?: string;
   bounds: Bounds;
   center: [number, number];
   clickable?: boolean;
   scrollable?: boolean;
+  editable?: boolean;
   actions?: string[];
   source: "accessibility" | "ocr";
   confidence?: number;
+  score?: number;
 };
 
 type ScreenshotResult = ToolResult & {
@@ -487,9 +492,11 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
   const ocr = shouldRunOcr ? await runOcr(screenshot, options) : undefined;
   const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], options.maxNodes);
+  const snapshotId = createSnapshotId(compact, nodes);
 
   return {
     ...(includeScreenshot ? screenshot : {}),
+    snapshotId,
     packageName: compact.packageName,
     width: includeScreenshot ? screenshot.width : compact.width,
     height: includeScreenshot ? screenshot.height : compact.height,
@@ -729,9 +736,7 @@ function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNo
 
 function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: SemanticNode[], maxNodes: number): SemanticNode[] {
   const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes]);
-  return merged
-    .sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0] || sourceRank(a.source) - sourceRank(b.source))
-    .slice(0, maxNodes);
+  return assignSnapshotRefs(rankSemanticNodes(merged).slice(0, maxNodes));
 }
 
 function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
@@ -749,8 +754,113 @@ function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
   return result;
 }
 
+function rankSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
+  return nodes
+    .map((node) => {
+      const role = inferNodeRole(node);
+      const editable = isNodeEditable(node, role);
+      const scoredNode = { ...node, ...(role ? { role } : {}), editable };
+      return { ...scoredNode, score: scoreSemanticNode(scoredNode) };
+    })
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0] || sourceRank(a.source) - sourceRank(b.source));
+}
+
+function assignSnapshotRefs(nodes: SemanticNode[]): SemanticNode[] {
+  let accessibilityIndex = 0;
+  let ocrIndex = 0;
+  return nodes.map((node) => ({
+    ...node,
+    ref: node.source === "accessibility" ? `a${++accessibilityIndex}` : `o${++ocrIndex}`
+  }));
+}
+
+function inferNodeRole(node: SemanticNode): string | undefined {
+  const className = node.className ?? "";
+  if (isNodeEditable(node)) {
+    return "textbox";
+  }
+  if (className.includes("CheckBox")) {
+    return "checkbox";
+  }
+  if (className.includes("Switch")) {
+    return "switch";
+  }
+  if (className.includes("Button") || (node.clickable && Boolean(node.text || node.contentDesc))) {
+    return "button";
+  }
+  if (node.scrollable) {
+    return "scrollable";
+  }
+  if (node.text || node.contentDesc || node.source === "ocr") {
+    return "text";
+  }
+  return undefined;
+}
+
+function isNodeEditable(node: SemanticNode, role?: string): boolean {
+  return role === "textbox" || (node.className ?? "").includes("EditText") || actionNames(node).includes("set_text");
+}
+
+function scoreSemanticNode(node: SemanticNode): number {
+  let score = node.source === "accessibility" ? 0.4 : 0.2;
+  if (node.editable) {
+    score += 0.5;
+  }
+  if (node.clickable) {
+    score += 0.3;
+  }
+  if (node.scrollable) {
+    score += 0.18;
+  }
+  if (node.resourceId) {
+    score += 0.12;
+  }
+  if (node.contentDesc) {
+    score += 0.1;
+  }
+  if (node.text) {
+    score += 0.08;
+  }
+  if (node.role === "button" || node.role === "checkbox" || node.role === "switch") {
+    score += 0.12;
+  }
+  if (node.role === "text" && node.source === "ocr") {
+    score += 0.05;
+  }
+  return Math.min(1, Number(score.toFixed(3)));
+}
+
+function actionNames(node: SemanticNode): string[] {
+  return (node.actions ?? []).map((action) => action.toLowerCase());
+}
+
 function sourceRank(source: SemanticNode["source"]): number {
   return source === "accessibility" ? 0 : 1;
+}
+
+function createSnapshotId(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
+  const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
+  const width = typeof compact.width === "number" ? compact.width : "";
+  const height = typeof compact.height === "number" ? compact.height : "";
+  const signature = JSON.stringify({
+    packageName,
+    width,
+    height,
+    nodes: nodes.map((node) => ({
+      source: node.source,
+      role: node.role,
+      text: node.text,
+      contentDesc: node.contentDesc,
+      resourceId: node.resourceId,
+      className: node.className,
+      bounds: node.bounds,
+      clickable: node.clickable === true,
+      scrollable: node.scrollable === true,
+      editable: node.editable === true
+    }))
+  });
+  const hash = createHash("sha256").update(signature).digest("hex").slice(0, 10);
+  return `screen:${Date.now()}:${hash}`;
 }
 
 function parseBounds(value: string): Bounds | undefined {

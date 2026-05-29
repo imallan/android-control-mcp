@@ -31,6 +31,24 @@ ADB-backed MCP tools:
 - `force`: always run OCR and merge OCR nodes with accessibility nodes.
 - `off`: return accessibility nodes only.
 
+`android_get_semantic_screen` returns a `snapshotId` and compact semantic nodes. Each returned node includes a snapshot-local `ref`:
+
+- Accessibility refs use `a1`, `a2`, `a3`, etc.
+- OCR refs use `o1`, `o2`, `o3`, etc.
+- Refs are stable only within the returned snapshot. They are not permanent element IDs.
+- Future ref-based action tools should pass both `snapshotId` and `ref`, then reject or relocate stale refs when the screen has changed.
+
+Semantic nodes may also include:
+
+- `role`: best-effort role inferred from Android class names, actions, and OCR source.
+- `editable`: whether the node appears to support text editing.
+- `score`: usefulness score for agent selection and default ordering.
+
+OCR-backed tools accept `ocrEngine`:
+
+- `apple-vision`: local Apple Vision text recognition through the Swift helper, macOS-only, default.
+- `tesseract`: local Tesseract TSV output, portable fallback.
+
 ## Android Bridge
 
 The Android persistent server uses newline-delimited JSON over an adb-forwarded socket.
