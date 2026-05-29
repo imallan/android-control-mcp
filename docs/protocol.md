@@ -12,6 +12,7 @@ Bridge-backed MCP tools:
 - `android_dump_compact`
 - `android_tap`
 - `android_swipe`
+- `android_input_text`
 - `android_key`
 - `android_perform_action`
 - `android_long_press`
@@ -25,6 +26,21 @@ ADB-backed MCP tools:
 ## Android Bridge
 
 The Android persistent server uses newline-delimited JSON over an adb-forwarded socket.
+
+Supported bridge methods:
+
+- `ping`
+- `exit`
+- `dumpXml`
+- `dumpCompact`
+- `tap`
+- `swipe`
+- `inputText`
+- `performAction`
+- `longPress`
+- `key`
+- `listApps`
+- `launchApp`
 
 Request:
 

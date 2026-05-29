@@ -17,7 +17,7 @@ on-device bridge, exposed over MCP stdio:
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 24+
 - Android platform-tools with `adb` on `PATH`
 - One authorized Android device, or `ANDROID_SERIAL` set when multiple devices are connected
 - The Android bridge jar built and started with `../android-server/scripts/start-uiautomator-server.sh`
@@ -90,14 +90,14 @@ Restart or reload Codex after installation so it discovers the tools.
 
 ## Transport Notes
 
-- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, and `android_key` require the persistent Android bridge.
+- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
 - `android_screenshot` still uses direct ADB because the Android bridge does not yet expose screenshot capture.
 - The MCP server refreshes `adb forward tcp:$ANDROID_UI_MCP_PORT localabstract:android-ui-mcp` before each bridge call.
 
 ## Limitations
 
 - `android_screenshot` writes `/tmp/android-ui-mcp/current-screen.png` by default. Use `retain=true` only when you want historical screenshots.
-- `adb shell input text` has limited Unicode support on some Android builds.
+- Text input uses accessibility `ACTION_SET_TEXT` when possible, but depends on the target node exposing editable accessibility actions.
 - App-name launch uses package/activity-derived aliases. `applicationId` launch is deterministic.
 - `FLAG_SECURE` apps can return black screenshots.
 - WebView, OpenGL, and game screens may expose little or no accessibility tree.

@@ -2,42 +2,62 @@
 
 ## Current State
 
-This repo contains a Phase 1 Android UI MCP bridge. It is a local stdio MCP server implemented in TypeScript and run directly by Node 24, with no npm dependencies.
+This repo contains a local Android UI automation MCP server with a persistent Android-side UIAutomator bridge.
 
-The server shells out to `adb` for Android automation and currently exposes:
+The desktop MCP server is implemented in TypeScript, runs over stdio, and exposes MCP `tools/list` and `tools/call`. It delegates most UI operations to an Android process started with `uiautomator runtest` and reached through:
 
-- `android_screenshot`
+```sh
+adb forward tcp:27183 localabstract:android-ui-mcp
+```
+
+The Android bridge is implemented in Kotlin in `android-server/src/com/example/androiduiserver/BridgeTest.kt`.
+
+## Exposed MCP Tools
+
+Bridge-backed tools:
+
+- `android_bridge_ping`
+- `android_bridge_exit`
 - `android_dump_tree`
+- `android_dump_compact`
 - `android_tap`
 - `android_swipe`
 - `android_input_text`
+- `android_perform_action`
+- `android_long_press`
 - `android_key`
 - `android_list_apps`
 - `android_launch_app`
 
-The project has been initialized as a git repo and pushed to a private GitHub repository:
+ADB-backed tools:
 
-```text
-https://github.com/imallan/android-control-mcp
-```
+- `android_screenshot`
 
 ## Core Implementation
 
-The main implementation is in:
+Main desktop implementation:
 
 ```text
 desktop-mcp/src/server.ts
 ```
 
+Main Android bridge implementation:
+
+```text
+android-server/src/com/example/androiduiserver/BridgeTest.kt
+```
+
 Important behavior:
 
-- MCP transport is stdio with JSON-RPC handling for `initialize`, `tools/list`, and `tools/call`.
+- MCP transport is stdio with direct JSON-RPC handling.
+- The desktop server refreshes `adb forward` before bridge calls.
 - Screenshots use `adb exec-out screencap -p`.
-- Accessibility trees use `uiautomator dump /sdcard/window.xml` and `adb exec-out cat`.
-- Input actions use `adb shell input`.
-- App listing uses launcher activities from `cmd package query-activities`.
-- App launching uses `monkey -p <applicationId> -c android.intent.category.LAUNCHER 1`.
-- `ANDROID_SERIAL` is supported through the environment for multi-device setups.
+- Compact accessibility nodes are collected directly from `AccessibilityNodeInfo`.
+- XML hierarchy dumps are still available for debugging and compatibility.
+- Text input prefers accessibility `ACTION_SET_TEXT` through the bridge.
+- App listing uses launcher activities from Android package manager output.
+- App launching uses `monkey -p <applicationId> -c android.intent.category.LAUNCHER 1` from inside the bridge process.
+- `ANDROID_SERIAL` selects a target device when multiple devices are connected.
 
 Screenshot file policy:
 
@@ -48,95 +68,74 @@ Screenshot file policy:
 ```
 
 - `retain: true` creates a unique temp directory and preserves that screenshot.
-- Tree XML is not saved locally; it is returned directly as MCP output.
 
-## Local Installation
+## Local Workflow
 
-The MCP server has been installed into Codex global config:
-
-```toml
-[mcp_servers.android-ui-mcp]
-command = "npm"
-args = ["--prefix", "/Users/allan/Documents/Codex/misc/Android Control MCP/desktop-mcp", "run", "start"]
-
-[mcp_servers.android-ui-mcp.env]
-ANDROID_SERIAL = "R5GL14WS2XD"
-```
-
-Codex may need a restart/new session before the installed MCP appears as active tools.
-
-## Verified Behavior
-
-Verified locally against Android device serial:
-
-```text
-R5GL14WS2XD
-```
-
-Build check:
+Build the Android bridge:
 
 ```sh
-npm run build
+android-server/scripts/build-uiautomator-jar.sh
 ```
 
-passed.
+Start the Android bridge:
 
-MCP behavior verified:
+```sh
+android-server/scripts/start-uiautomator-server.sh
+```
 
-- `tools/list` returns all 8 tools.
-- Gmail can be launched by `applicationId`.
-- Gmail screenshot works at `1440 x 3120`.
-- Gmail accessibility tree exposes useful nodes such as search and compose.
-- `android_key HOME` succeeds.
-- `android_list_apps` can find Gmail.
-- `android_launch_app` works by both `applicationId` and unique app name.
-- Xiaohongshu (`com.xingin.xhs`) exposes a useful accessibility tree with feed cards, search, tabs, and bottom navigation.
-- WeChat (`com.tencent.mm`) launches, but its accessibility tree is effectively empty except for the root window node.
+Start the desktop MCP server:
+
+```sh
+cd desktop-mcp
+npm run start
+```
+
+For MCP clients, prefer the silent launcher:
+
+```sh
+scripts/start-desktop-mcp.sh
+```
+
+## Verified Locally
+
+Recent local checks:
+
+- `./gradlew :android-server:buildUiautomatorJar` passes.
+- `npm run build` in `desktop-mcp` passes.
+
+Previously verified behavior:
+
+- Gmail launches by `applicationId`.
+- Gmail screenshots work at device resolution.
+- Gmail exposes useful accessibility nodes such as search and compose.
+- `android_key HOME` works.
+- `android_list_apps` can find launcher apps.
+- `android_launch_app` works by deterministic `applicationId` and by unique app-name match.
+- Xiaohongshu (`com.xingin.xhs`) exposes a useful accessibility tree.
+- WeChat (`com.tencent.mm`) can launch, but often exposes a sparse accessibility tree.
 
 ## Known Limitations
 
-- This is still Phase 1: every tool call shells out to `adb`, so latency is higher than a persistent Android-side server.
-- There is no Android jar/server yet.
-- Multi-device selection depends on `ANDROID_SERIAL`; without it, `adb` returns “more than one device/emulator”.
-- App-name launch is best-effort:
-  - `applicationId` launch is deterministic.
-  - app name matching uses package/activity-derived aliases by default.
-  - `resolveLabels: true` can parse APK labels through local `aapt`, but this is slower and localization-sensitive.
-- `adb shell input text` has limited Unicode support.
-- `uiautomator dump` exposes accessibility/semantics, not the actual render tree.
-- WeChat and similar apps can expose almost no accessibility nodes.
-- `FLAG_SECURE` apps may return black screenshots.
-- There are no automated tests yet beyond manual MCP protocol checks and device verification.
+- `android_screenshot` still uses direct ADB because screenshot capture is not implemented in the Android bridge.
+- Multi-device selection is process-level through `ANDROID_SERIAL`; tools do not accept a per-call serial.
+- App-name matching is best effort. `applicationId` launch is deterministic.
+- `uiautomator` exposes the accessibility tree, not the full rendered view tree.
+- WebView, OpenGL, game, video, and some Compose screens may expose little or no useful accessibility data.
+- `FLAG_SECURE` windows can block screenshots.
+- OCR/CV fallback is planned but not implemented.
+- Automated tests are still minimal.
 
-## Not Done Yet
+## Recommended Next Work
 
-Highest priority next work:
+Highest priority:
 
 - Implement OCR/CV fallback from `docs/ocr-cv-fallback-plan.md`.
-  - Add `android_get_semantic_screen`.
-  - Add `android_ocr_screen`.
-  - Use local `tesseract` with `chi_sim+eng`.
-  - Return compact OCR/merged nodes instead of full OCR text.
-  - Trigger fallback automatically when tree is sparse, especially for WeChat.
+- Add `android_get_semantic_screen` as the default screen-understanding tool.
+- Add `android_ocr_screen` as a debugging and fallback tool.
 
-Next architecture milestone:
+Hardening:
 
-- Implement Phase 2 persistent Android server:
-  - Kotlin/JVM jar.
-  - launched with `app_process` as shell uid.
-  - `LocalServerSocket("android-ui-mcp")`.
-  - desktop connects through `adb forward tcp:27183 localabstract:android-ui-mcp`.
-  - newline-delimited JSON protocol.
-
-Polish and hardening:
-
-- Add a real MCP SDK implementation if the direct JSON-RPC server becomes insufficient.
-- Add structured tests for JSON-RPC requests, input validation, and ADB error normalization.
-- Add bounded output modes for tree dumps to reduce token usage.
-- Improve app label resolution and cache APK label lookups.
-- Add explicit support for selecting device serial per tool call, not only through env.
-- Add health/check tools such as `android_devices` and `android_current_app`.
-
-## Recommended Next Step
-
-Build OCR fallback first, before the Android persistent server. WeChat has already shown the practical gap: the ADB/tree/action loop works, but some real apps need screenshot-derived semantic nodes to be useful.
+- Add `android_devices` and `android_current_app`.
+- Add bridge health diagnostics and clearer startup failure messages.
+- Add structured tests for MCP request handling, input validation, bridge error normalization, and selector behavior.
+- Update compatibility notes as more devices and Android versions are tested.

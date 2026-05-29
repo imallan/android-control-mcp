@@ -17,7 +17,11 @@ mapping and sends newline-delimited JSON requests to the Android-side bridge for
 UIAutomator operations.
 
 Direct ADB commands are still used for capabilities not yet implemented by the bridge:
-screenshot capture, text input, app listing, and app launch.
+screenshot capture.
+
+Text input, app listing, and app launch now run through the Android bridge. The bridge
+still uses Android shell/UIAutomator facilities internally where appropriate, but those
+operations avoid a new desktop-side `adb shell` process per MCP call.
 
 ## Earlier MVP
 

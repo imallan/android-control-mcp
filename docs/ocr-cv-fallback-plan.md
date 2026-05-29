@@ -1,51 +1,60 @@
-# OCR/CV Fallback 设计计划
+# OCR/CV Fallback Plan
 
 ## Summary
 
-为 Android MCP 增加本地视觉 fallback，用于微信这类 accessibility tree 为空或过稀疏的页面。默认策略是：优先用 accessibility tree；只有 tree 不够用时才触发本地 OCR/CV；返回给 LLM 的不是整图或完整 OCR 文本，而是精简后的可操作节点列表，控制 token 和延迟。
+Add a local vision fallback to the Android MCP for apps whose accessibility tree is empty or too sparse, such as WeChat. The default strategy is to prefer the accessibility tree and run OCR/CV only when the tree is not useful. The result returned to the LLM should be a compact list of actionable nodes, not the whole image or raw OCR text.
 
-本机已确认可用：
+Confirmed local dependencies:
 
 - `tesseract`
-- 中文/英文语言包：`chi_sim`、`chi_tra`、`eng`
-- macOS `sips` 可做轻量裁剪/缩放
-- 当前无 Python CV/PIL/OpenCV 依赖，所以 v1 不引入大模型或 Python 图像栈
+- OCR language packs: `chi_sim`, `chi_tra`, and `eng`
+- macOS `sips` for lightweight crop and resize operations
+- No current Python CV, PIL, or OpenCV dependency; v1 should avoid large model or Python image-stack requirements
 
-## Key Changes
+## Proposed Tools
 
-- 新增 MCP tool：`android_get_semantic_screen`
-  - 内部执行：screenshot + dump tree + sparse-tree 检测 + OCR fallback
-  - 返回统一节点：
+### `android_get_semantic_screen`
+
+Run screenshot capture, compact accessibility dump, sparse-tree detection, and OCR fallback when needed.
+
+Example response:
 
 ```json
 {
-  "imagePath": "...",
+  "imagePath": "/tmp/android-ui-mcp/current-screen.png",
   "width": 1440,
   "height": 3120,
   "treeUsable": false,
   "nodes": [
     {
       "id": "ocr:12",
-      "text": "搜索",
+      "text": "Search",
       "bounds": [1270, 155, 1406, 291],
       "center": [1338, 223],
       "clickable": true,
-      "source": "ocr|accessibility|merged",
+      "source": "ocr",
       "confidence": 87
     }
   ]
 }
 ```
 
-  - 默认最多返回 `80` 个节点；长文本截断到 `80` 字符；低置信度 OCR 默认过滤。
+Defaults:
 
-- 新增 MCP tool：`android_ocr_screen`
-  - 面向调试和特殊场景，只跑 OCR。
-  - 参数：
+- Return at most 80 nodes.
+- Truncate long text to 80 characters.
+- Filter out low-confidence OCR results.
+- Do not include raw XML or raw OCR output unless explicitly requested for debugging.
+
+### `android_ocr_screen`
+
+Debug and special-case tool that runs OCR directly.
+
+Input:
 
 ```json
 {
-  "roi": [x1, y1, x2, y2],
+  "roi": [0, 0, 1440, 3120],
   "langs": "chi_sim+eng",
   "maxNodes": 80,
   "minConfidence": 45,
@@ -53,61 +62,83 @@
 }
 ```
 
-  - 默认 OCR 全屏，但推荐由 agent 传 ROI，减少延迟和 token。
+Full-screen OCR should work by default, but agents should pass a region of interest when possible to reduce latency and token output.
 
-- sparse-tree 判定规则：
-  - XML 只有根节点，或有效 text/content-desc 节点少于 `3`
-  - 当前 package 属于已知弱 accessibility app，例如 `com.tencent.mm`
-  - tree 有节点但无可点击/可读节点时，也触发 OCR
+## Sparse-Tree Detection
 
-- 本地 OCR 实现：
-  - 使用 `tesseract image stdout -l chi_sim+eng --psm 6 tsv`
-  - 解析 TSV 的 `text/conf/left/top/width/height`
-  - 用 `sips` 生成 ROI 临时图，默认覆盖 `/tmp/android-ui-mcp/ocr-crop.png`
-  - `retain:true` 时才保留唯一截图/裁剪图
+Treat the accessibility tree as sparse when any of these are true:
+
+- The XML contains only the root node.
+- The compact tree has fewer than 3 useful text or content-description nodes.
+- The current package is a known weak-accessibility app, such as `com.tencent.mm`.
+- The tree has nodes but no readable or actionable nodes.
+
+## Local OCR Implementation
+
+Use Tesseract TSV output:
+
+```sh
+tesseract image stdout -l chi_sim+eng --psm 6 tsv
+```
+
+Parse these TSV fields:
+
+- `text`
+- `conf`
+- `left`
+- `top`
+- `width`
+- `height`
+
+Use `sips` to create ROI crops. By default, temporary crops should overwrite:
+
+```text
+/tmp/android-ui-mcp/ocr-crop.png
+```
+
+When `retain: true`, keep screenshots and crops in a unique temp directory.
 
 ## Performance And Token Strategy
 
-- 默认不把 OCR 原文整段返回，只返回去重、合并、排序后的节点。
-- OCR 结果合并规则：
-  - 同一行相邻文字块合并为 phrase
-  - 太小、太低置信度、纯噪声节点过滤
-  - 重复文本和高度重叠 bounds 去重
-- 默认优先跑顶部栏、底部导航、中心内容三类 ROI；全屏 OCR 只在必要时使用。
-- 缓存最近一次 screenshot 的 OCR 结果：
-  - 如果 image path 和 mtime 未变，直接复用 OCR nodes
-  - 执行动作后缓存失效
-- token 控制：
-  - `android_get_semantic_screen` 默认返回节点，不返回 XML
-  - 需要调试时才允许 `includeRawTree` 或 `includeRawOcr`
-  - 大字段默认关闭
+- Return compact nodes only, not complete OCR prose.
+- Merge adjacent words on the same line into phrases.
+- Filter tiny nodes, low-confidence nodes, and obvious OCR noise.
+- Deduplicate repeated text and highly overlapping bounds.
+- Prefer OCR over targeted regions such as the top bar, bottom navigation, and visible content area.
+- Use full-screen OCR only when targeted OCR is insufficient.
+- Cache the last OCR result by screenshot path and modification time.
+- Invalidate the cache after any action that changes UI state.
 
 ## Test Plan
 
-- 微信：
-  - launch `com.tencent.mm`
-  - `android_dump_tree` 只有根节点
-  - `android_get_semantic_screen` 自动触发 OCR fallback
-  - 返回可读 OCR nodes，且不超过默认节点上限
+WeChat:
 
-- 小红书：
-  - accessibility tree 可用
-  - `android_get_semantic_screen` 优先使用 tree nodes
-  - 不默认跑 OCR，除非 `forceOcr:true`
+- Launch `com.tencent.mm`.
+- Confirm `android_dump_tree` is sparse.
+- Confirm `android_get_semantic_screen` triggers OCR fallback.
+- Confirm returned OCR nodes are readable and below the default node limit.
 
-- Gmail：
-  - tree 可用
-  - 搜索框、写邮件按钮、底部 tab 能进入 merged nodes
+Xiaohongshu:
 
-- Performance:
-  - tree 可用路径不跑 OCR
-  - ROI OCR 明显快于全屏 OCR
-  - 连续两次无变化截图命中缓存
+- Confirm the accessibility tree is usable.
+- Confirm `android_get_semantic_screen` prefers accessibility nodes.
+- Confirm OCR does not run by default unless `forceOcr: true` is passed.
+
+Gmail:
+
+- Confirm the accessibility tree is usable.
+- Confirm search, compose, and bottom-tab nodes appear in merged semantic output.
+
+Performance:
+
+- Confirm the tree-usable path does not run OCR.
+- Confirm ROI OCR is faster than full-screen OCR.
+- Confirm consecutive unchanged screenshots hit the OCR cache.
 
 ## Assumptions
 
-- v1 完全本地运行，不调用云 OCR，不上传截图。
-- v1 不引入 OpenCV/PaddleOCR/YOLO；先用 Tesseract + lightweight heuristics。
-- 真正的 CV object detection 作为 Phase 2，可选接入本地模型，但默认关闭。
-- 对微信这类页面，fallback 目标是“能读出文字和估算点击位置”，不是还原完整 View tree。
-- 最稳点击策略仍是：优先 accessibility bounds；没有 tree 时使用 OCR bounds center。
+- v1 runs completely locally and does not upload screenshots.
+- v1 does not add OpenCV, PaddleOCR, YOLO, or cloud OCR.
+- CV object detection can be a later optional phase, disabled by default.
+- For weak-accessibility apps, the fallback goal is to read visible text and estimate click positions, not reconstruct the full view tree.
+- The most reliable click strategy remains: prefer accessibility bounds; use OCR bounds centers only when accessibility nodes are unavailable.

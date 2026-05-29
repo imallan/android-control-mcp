@@ -120,7 +120,10 @@ Supported methods:
 - `inputText`
 - `performAction`
 - `swipe`
+- `longPress`
 - `key`
+- `listApps`
+- `launchApp`
 - `exit`
 
 ## Why this is faster
