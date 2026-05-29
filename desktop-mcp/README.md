@@ -5,6 +5,10 @@ on-device bridge, exposed over MCP stdio:
 
 - `android_bridge_ping`: verify that the on-device bridge is reachable
 - `android_bridge_exit`: stop the on-device bridge
+- `android_current_app`: return the current foreground Android package
+- `android_wait_for_package`
+- `android_wait_for_text`
+- `android_wait_for_screen_change`
 - `android_screenshot`: overwrites one stable temp file by default; pass `retain=true` to keep a unique screenshot
 - `android_ocr_screen`: run local OCR on the current screenshot and return compact OCR nodes
 - `android_get_semantic_screen`: return accessibility nodes with automatic or forced OCR fallback
@@ -100,7 +104,7 @@ Restart or reload Codex after installation so it discovers the tools.
 
 ## Transport Notes
 
-- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
+- `android_current_app`, `android_wait_for_package`, `android_wait_for_text`, `android_wait_for_screen_change`, `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
 - `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
 - `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
 - `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.

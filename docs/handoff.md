@@ -18,6 +18,10 @@ Bridge-backed tools:
 
 - `android_bridge_ping`
 - `android_bridge_exit`
+- `android_current_app`
+- `android_wait_for_package`
+- `android_wait_for_text`
+- `android_wait_for_screen_change`
 - `android_dump_tree`
 - `android_dump_compact`
 - `android_tap`

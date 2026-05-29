@@ -148,6 +148,7 @@ class BridgeTest : UiAutomatorTestCase() {
       "inputText" -> inputText(request)
       "performAction" -> performAction(request)
       "longPress" -> longPress(request)
+      "currentApp" -> currentApp()
       "listApps" -> listApps()
       "launchApp" -> launchApp(request)
       "swipe" -> {
@@ -190,6 +191,13 @@ class BridgeTest : UiAutomatorTestCase() {
       "height" to device.displayHeight,
       "nodes" to nodes,
       "nodeCount" to nodes.size
+    )
+  }
+
+  private fun currentApp(): LinkedHashMap<String, Any?> {
+    return linkedMapOf(
+      "ok" to true,
+      "packageName" to device.currentPackageName
     )
   }
 

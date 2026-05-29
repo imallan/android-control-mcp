@@ -8,6 +8,10 @@ Bridge-backed MCP tools:
 
 - `android_bridge_ping`
 - `android_bridge_exit`
+- `android_current_app`
+- `android_wait_for_package`
+- `android_wait_for_text`
+- `android_wait_for_screen_change`
 - `android_get_semantic_screen`
 - `android_dump_tree`
 - `android_dump_compact`
@@ -83,6 +87,15 @@ Convenience actions operate on the current accessibility snapshot and do not use
 
 If a convenience action finds no match, it returns `success: false` with a `*_not_found` status and the current snapshot. If multiple nodes match, it returns `success: false` with a `*_ambiguous` status and candidate refs, without sending an input event.
 
+Wait and recovery tools:
+
+- `android_current_app`: returns the current foreground package name.
+- `android_wait_for_package`: polls `android_current_app` until `packageName` matches.
+- `android_wait_for_text`: polls current accessibility snapshots until text appears.
+- `android_wait_for_screen_change`: polls accessibility snapshots until `screenSignature` changes from a supplied `snapshotId`, supplied `screenSignature`, or an initial baseline captured by the tool.
+
+Wait tools accept `timeoutMs` and `pollIntervalMs` and return `success: true` when the condition is met, otherwise `success: false` with a timeout status and the latest observed state.
+
 OCR-backed tools accept `ocrEngine`:
 
 - `apple-vision`: local Apple Vision text recognition through the Swift helper, macOS-only, default.
@@ -103,6 +116,7 @@ Supported bridge methods:
 - `inputText`
 - `performAction`
 - `longPress`
+- `currentApp`
 - `key`
 - `listApps`
 - `launchApp`

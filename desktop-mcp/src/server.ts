@@ -141,6 +141,8 @@ const APPLE_VISION_OCR_SOURCE = join(MODULE_DIR, "..", "apple-vision-ocr.swift")
 const APPLE_VISION_OCR_BIN = process.env.ANDROID_MCP_APPLE_VISION_OCR_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-ocr");
 const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-cache");
 const SNAPSHOT_CACHE_LIMIT = 20;
+const DEFAULT_WAIT_TIMEOUT_MS = 5_000;
+const DEFAULT_WAIT_POLL_INTERVAL_MS = 300;
 
 const snapshotCache = new Map<string, SnapshotCacheEntry>();
 
@@ -1409,6 +1411,56 @@ function labelFieldDistance(label: SemanticNode, field: SemanticNode): number {
   return Number.POSITIVE_INFINITY;
 }
 
+function waitOptions(input: Record<string, unknown>): { timeoutMs: number; pollIntervalMs: number } {
+  const timeoutMs = optionalIntegerParam(input, "timeoutMs", DEFAULT_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = optionalIntegerParam(input, "pollIntervalMs", DEFAULT_WAIT_POLL_INTERVAL_MS);
+  return {
+    timeoutMs: Math.max(1, timeoutMs),
+    pollIntervalMs: Math.max(50, pollIntervalMs)
+  };
+}
+
+async function pollUntil<T>(
+  options: { timeoutMs: number; pollIntervalMs: number },
+  check: () => Promise<{ done: boolean; data: T }>
+): Promise<{ done: boolean; elapsedMs: number; data: T }> {
+  const start = performance.now();
+  let last: { done: boolean; data: T } | undefined;
+  while (performance.now() - start <= options.timeoutMs) {
+    last = await check();
+    if (last.done) {
+      return { done: true, elapsedMs: Math.round(performance.now() - start), data: last.data };
+    }
+    await sleep(options.pollIntervalMs);
+  }
+  if (!last) {
+    last = await check();
+  }
+  return { done: last.done, elapsedMs: Math.round(performance.now() - start), data: last.data };
+}
+
+function waitResult(
+  success: boolean,
+  elapsedMs: number,
+  options: { timeoutMs: number; pollIntervalMs: number },
+  data: Record<string, unknown>,
+  successStatus: string,
+  timeoutStatus: string
+): ToolResult {
+  return {
+    success,
+    status: success ? successStatus : timeoutStatus,
+    elapsedMs,
+    timeoutMs: options.timeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    ...data
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseBounds(value: string): Bounds | undefined {
   const match = /^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/.exec(value);
   if (!match) {
@@ -1671,6 +1723,72 @@ async function androidKey(input: unknown): Promise<ToolResult> {
   return normalizeBridgeSuccess({ ...response, key, keycode });
 }
 
+async function androidCurrentApp(input: unknown): Promise<ToolResult> {
+  optionalObject(input);
+  const response = await androidBridgeRpc("currentApp");
+  return {
+    ...response,
+    packageName: typeof response.packageName === "string" ? response.packageName : undefined
+  };
+}
+
+async function androidWaitForPackage(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const packageName = stringParam(params, "packageName");
+  const wait = waitOptions(params);
+  const result = await pollUntil(wait, async () => {
+    const current = await androidCurrentApp({});
+    return {
+      done: current.packageName === packageName,
+      data: { currentApp: current }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "package_found", "package_timeout");
+}
+
+async function androidWaitForText(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const text = stringParam(params, "text");
+  const role = optionalStringParam(params, "role");
+  const fuzzy = optionalBooleanParam(params, "fuzzy", false);
+  const wait = waitOptions(params);
+  const result = await pollUntil(wait, async () => {
+    const snapshot = await currentAccessibilitySnapshot();
+    const matches = findNodesByLocator(snapshot.nodes, { text, role, fuzzy });
+    return {
+      done: matches.length > 0,
+      data: {
+        currentSnapshot: snapshot,
+        matches: matches.slice(0, 10).map((node) => nodeRefSummary(snapshot.snapshotId, node))
+      }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "text_found", "text_timeout");
+}
+
+async function androidWaitForScreenChange(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const wait = waitOptions(params);
+  const snapshotId = optionalStringParam(params, "snapshotId");
+  const screenSignature = optionalStringParam(params, "screenSignature");
+  let baseline = screenSignature;
+  if (!baseline && snapshotId) {
+    baseline = snapshotCache.get(snapshotId)?.screenSignature;
+  }
+  if (!baseline) {
+    baseline = (await currentAccessibilitySnapshot()).screenSignature;
+  }
+
+  const result = await pollUntil(wait, async () => {
+    const snapshot = await currentAccessibilitySnapshot();
+    return {
+      done: snapshot.screenSignature !== baseline,
+      data: { baselineScreenSignature: baseline, currentSnapshot: snapshot }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "screen_changed", "screen_change_timeout");
+}
+
 async function androidBridgePing(input: unknown): Promise<ToolResult> {
   optionalObject(input);
   return androidBridgeRpc("ping");
@@ -1899,6 +2017,59 @@ const tools: ToolDefinition[] = [
     description: "Ask the persistent on-device UIAutomator bridge to stop serving requests.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: androidBridgeExit
+  },
+  {
+    name: "android_current_app",
+    description: "Return the current foreground Android package reported by the on-device bridge.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidCurrentApp
+  },
+  {
+    name: "android_wait_for_package",
+    description: "Poll the foreground package until it matches the requested package name or times out.",
+    inputSchema: {
+      type: "object",
+      required: ["packageName"],
+      properties: {
+        packageName: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForPackage
+  },
+  {
+    name: "android_wait_for_text",
+    description: "Poll the current accessibility snapshot until at least one node matches text.",
+    inputSchema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        text: { type: "string", minLength: 1 },
+        role: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForText
+  },
+  {
+    name: "android_wait_for_screen_change",
+    description: "Poll accessibility snapshots until the screen signature differs from a baseline snapshot or signature.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        screenSignature: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForScreenChange
   },
   {
     name: "android_screenshot",
