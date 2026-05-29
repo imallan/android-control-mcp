@@ -46,6 +46,20 @@ type SemanticNode = {
   score?: number;
 };
 
+type SemanticSnapshot = {
+  snapshotId: string;
+  screenSignature: string;
+  packageName?: string;
+  width?: number;
+  height?: number;
+  nodes: SemanticNode[];
+  nodeCount: number;
+};
+
+type SnapshotCacheEntry = SemanticSnapshot & {
+  createdAtMs: number;
+};
+
 type ScreenshotResult = ToolResult & {
   imagePath: string;
   width: number;
@@ -95,6 +109,9 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const APPLE_VISION_OCR_SOURCE = join(MODULE_DIR, "..", "apple-vision-ocr.swift");
 const APPLE_VISION_OCR_BIN = process.env.ANDROID_MCP_APPLE_VISION_OCR_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-ocr");
 const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-cache");
+const SNAPSHOT_CACHE_LIMIT = 20;
+
+const snapshotCache = new Map<string, SnapshotCacheEntry>();
 
 const KEYCODES: Record<string, string> = {
   BACK: "KEYCODE_BACK",
@@ -500,11 +517,13 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
   const ocr = shouldRunOcr ? await runOcr(screenshot, options) : undefined;
   const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], options.maxNodes);
-  const snapshotId = createSnapshotId(compact, nodes);
+  const snapshot = createSemanticSnapshot(compact, nodes);
+  rememberSnapshot(snapshot);
 
   return {
     ...(includeScreenshot ? screenshot : {}),
-    snapshotId,
+    snapshotId: snapshot.snapshotId,
+    screenSignature: snapshot.screenSignature,
     packageName: compact.packageName,
     width: includeScreenshot ? screenshot.width : compact.width,
     height: includeScreenshot ? screenshot.height : compact.height,
@@ -515,8 +534,8 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
     treeUsable: tree.usable,
     accessibilityNodeCount: accessibilityNodes.length,
     ocrNodeCount: ocr?.nodes.length ?? 0,
-    nodes,
-    nodeCount: nodes.length,
+    nodes: snapshot.nodes,
+    nodeCount: snapshot.nodeCount,
     ...(includeRawTree ? { compactTree: compact } : {}),
     ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {})
   };
@@ -975,7 +994,40 @@ function sourceRank(source: SemanticNode["source"]): number {
   return source === "accessibility" ? 0 : 1;
 }
 
-function createSnapshotId(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
+function createSemanticSnapshot(compact: Record<string, unknown>, nodes: SemanticNode[]): SemanticSnapshot {
+  const screenSignature = createScreenSignature(compact, nodes);
+  return {
+    snapshotId: createSnapshotId(screenSignature),
+    screenSignature,
+    packageName: typeof compact.packageName === "string" ? compact.packageName : undefined,
+    width: typeof compact.width === "number" ? compact.width : undefined,
+    height: typeof compact.height === "number" ? compact.height : undefined,
+    nodes,
+    nodeCount: nodes.length
+  };
+}
+
+function rememberSnapshot(snapshot: SemanticSnapshot): void {
+  snapshotCache.set(snapshot.snapshotId, { ...snapshot, createdAtMs: Date.now() });
+  while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldestKey = snapshotCache.keys().next().value as string | undefined;
+    if (!oldestKey) {
+      break;
+    }
+    snapshotCache.delete(oldestKey);
+  }
+}
+
+function currentAccessibilitySnapshot(): Promise<SemanticSnapshot> {
+  return androidDumpCompact().then((compact) => {
+    const nodes = mergeSemanticNodes(compactNodes(compact), [], 80);
+    const snapshot = createSemanticSnapshot(compact, nodes);
+    rememberSnapshot(snapshot);
+    return snapshot;
+  });
+}
+
+function createScreenSignature(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
   const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
   const width = typeof compact.width === "number" ? compact.width : "";
   const height = typeof compact.height === "number" ? compact.height : "";
@@ -983,21 +1035,113 @@ function createSnapshotId(compact: Record<string, unknown>, nodes: SemanticNode[
     packageName,
     width,
     height,
-    nodes: nodes.map((node) => ({
-      source: node.source,
-      role: node.role,
-      text: node.text,
-      contentDesc: node.contentDesc,
-      resourceId: node.resourceId,
-      className: node.className,
-      bounds: node.bounds,
-      clickable: node.clickable === true,
-      scrollable: node.scrollable === true,
-      editable: node.editable === true
-    }))
+    nodes: nodes
+      .filter((node) => node.source === "accessibility")
+      .map((node) => ({
+        role: node.role,
+        text: node.text,
+        contentDesc: node.contentDesc,
+        resourceId: node.resourceId,
+        className: node.className,
+        bounds: node.bounds,
+        clickable: node.clickable === true,
+        scrollable: node.scrollable === true,
+        editable: node.editable === true
+      }))
   });
-  const hash = createHash("sha256").update(signature).digest("hex").slice(0, 10);
-  return `screen:${Date.now()}:${hash}`;
+  return createHash("sha256").update(signature).digest("hex").slice(0, 16);
+}
+
+function createSnapshotId(screenSignature: string): string {
+  return `screen:${Date.now()}:${screenSignature.slice(0, 10)}`;
+}
+
+function relocateAccessibilityNode(
+  original: SemanticNode,
+  currentNodes: SemanticNode[]
+): { node?: SemanticNode; status: "stale_ref_not_found" | "stale_ref_ambiguous"; message: string; candidates?: Record<string, unknown>[] } {
+  const candidates = currentNodes.filter((node) => node.source === "accessibility");
+  const strategies: Array<{ name: string; matches: SemanticNode[] }> = [
+    {
+      name: "resourceId_role",
+      matches:
+        original.resourceId && original.role
+          ? candidates.filter((node) => node.resourceId === original.resourceId && node.role === original.role)
+          : []
+    },
+    {
+      name: "contentDesc_role",
+      matches:
+        original.contentDesc && original.role
+          ? candidates.filter((node) => node.contentDesc === original.contentDesc && node.role === original.role)
+          : []
+    },
+    {
+      name: "text_role",
+      matches: original.text && original.role ? candidates.filter((node) => node.text === original.text && node.role === original.role) : []
+    },
+    {
+      name: "label_class_bounds",
+      matches: candidates.filter(
+        (node) =>
+          samePrimaryLabel(original, node) &&
+          Boolean(original.className) &&
+          node.className === original.className &&
+          boundsAreNear(original.bounds, node.bounds)
+      )
+    }
+  ];
+
+  for (const strategy of strategies) {
+    if (strategy.matches.length === 1) {
+      return { node: strategy.matches[0], status: "stale_ref_not_found", message: `Relocated by ${strategy.name}.` };
+    }
+    if (strategy.matches.length > 1) {
+      return {
+        status: "stale_ref_ambiguous",
+        message: `The original ref is stale and ${strategy.matches.length} current accessibility nodes match ${strategy.name}.`,
+        candidates: strategy.matches.slice(0, 10).map((node) => nodeRefSummary(undefined, node))
+      };
+    }
+  }
+
+  return {
+    status: "stale_ref_not_found",
+    message: "The original ref is stale and no current accessibility node matched conservatively."
+  };
+}
+
+function samePrimaryLabel(left: SemanticNode, right: SemanticNode): boolean {
+  const leftLabel = left.text ?? left.contentDesc;
+  const rightLabel = right.text ?? right.contentDesc;
+  return Boolean(leftLabel && rightLabel && leftLabel === rightLabel);
+}
+
+function boundsAreNear(left: Bounds, right: Bounds): boolean {
+  const leftCenter = boundsCenter(left);
+  const rightCenter = boundsCenter(right);
+  const dx = leftCenter[0] - rightCenter[0];
+  const dy = leftCenter[1] - rightCenter[1];
+  const distance = Math.sqrt(dx * dx + dy * dy);
+  const leftWidth = Math.max(1, left[2] - left[0]);
+  const leftHeight = Math.max(1, left[3] - left[1]);
+  return distance <= Math.max(120, Math.max(leftWidth, leftHeight));
+}
+
+function nodeRefSummary(snapshotId: string | undefined, node: SemanticNode): Record<string, unknown> {
+  return {
+    ...(snapshotId ? { snapshotId } : {}),
+    ref: node.ref,
+    id: node.id,
+    text: node.text,
+    contentDesc: node.contentDesc,
+    resourceId: node.resourceId,
+    className: node.className,
+    role: node.role,
+    bounds: node.bounds,
+    center: node.center,
+    source: node.source
+  };
 }
 
 function parseBounds(value: string): Bounds | undefined {
@@ -1054,6 +1198,70 @@ async function androidTap(input: unknown): Promise<ToolResult> {
   const y = numberParam(params, "y");
   const response = await androidBridgeRpc("tap", { x, y });
   return normalizeBridgeSuccess(response);
+}
+
+async function androidTapRef(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const cached = snapshotCache.get(snapshotId);
+  if (!cached) {
+    return {
+      success: false,
+      status: "expired_snapshot",
+      message: "The requested snapshotId is no longer cached. Call android_get_semantic_screen again.",
+      snapshotId,
+      ref
+    };
+  }
+
+  const originalNode = cached.nodes.find((node) => node.ref === ref);
+  if (!originalNode) {
+    return {
+      success: false,
+      status: "ref_not_found",
+      message: "The requested ref was not found in the cached snapshot.",
+      snapshotId,
+      ref
+    };
+  }
+  if (originalNode.source !== "accessibility") {
+    return {
+      success: false,
+      status: "unsupported_ref_source",
+      message: "OCR refs are observation-only and cannot be tapped by ref in v1.",
+      snapshotId,
+      ref,
+      source: originalNode.source
+    };
+  }
+
+  const current = await currentAccessibilitySnapshot();
+  const fresh = current.screenSignature === cached.screenSignature;
+  const target = fresh ? { node: originalNode } : relocateAccessibilityNode(originalNode, current.nodes);
+  if (!target.node) {
+    return {
+      success: false,
+      status: target.status,
+      message: target.message,
+      from: nodeRefSummary(cached.snapshotId, originalNode),
+      candidates: target.candidates,
+      ...(returnSnapshot ? { currentSnapshot: current } : {})
+    };
+  }
+
+  const [x, y] = target.node.center;
+  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc("tap", { x, y }));
+  const afterSnapshot = returnSnapshot ? await currentAccessibilitySnapshot() : undefined;
+  return {
+    ...tapResult,
+    status: fresh ? "fresh" : "relocated",
+    actionStrategy: "coordinate_tap",
+    from: nodeRefSummary(cached.snapshotId, originalNode),
+    target: nodeRefSummary(fresh ? cached.snapshotId : current.snapshotId, target.node),
+    ...(afterSnapshot ? { currentSnapshot: afterSnapshot } : {})
+  };
 }
 
 async function androidSwipe(input: unknown): Promise<ToolResult> {
@@ -1427,6 +1635,21 @@ const tools: ToolDefinition[] = [
       additionalProperties: false
     },
     handler: androidTap
+  },
+  {
+    name: "android_tap_ref",
+    description: "Tap an accessibility node by snapshot-local ref, with stale-screen detection and conservative relocation. OCR refs are observation-only and rejected.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref"],
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        returnSnapshot: { type: "boolean", default: true }
+      },
+      additionalProperties: false
+    },
+    handler: androidTapRef
   },
   {
     name: "android_swipe",
