@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -18,6 +18,39 @@ type JsonRpcRequest = {
 };
 
 type ToolResult = Record<string, unknown>;
+
+type Bounds = [number, number, number, number];
+
+type OcrMode = "auto" | "force" | "off";
+
+type SemanticNode = {
+  id: string;
+  text?: string;
+  contentDesc?: string;
+  resourceId?: string;
+  className?: string;
+  bounds: Bounds;
+  center: [number, number];
+  clickable?: boolean;
+  scrollable?: boolean;
+  actions?: string[];
+  source: "accessibility" | "ocr";
+  confidence?: number;
+};
+
+type ScreenshotResult = ToolResult & {
+  imagePath: string;
+  width: number;
+  height: number;
+  retained: boolean;
+};
+
+type OcrWord = {
+  text: string;
+  confidence: number;
+  bounds: Bounds;
+  lineKey: string;
+};
 
 type AndroidApp = {
   applicationId: string;
@@ -46,6 +79,7 @@ type ToolDefinition = {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_ADB_TIMEOUT_MS ?? 15_000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_SCREENSHOT_TIMEOUT_MS ?? 20_000);
+const OCR_TIMEOUT_MS = Number(process.env.ANDROID_MCP_OCR_TIMEOUT_MS ?? 30_000);
 const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
@@ -276,6 +310,17 @@ function numberParam(input: Record<string, unknown>, name: string): number {
   return value as number;
 }
 
+function optionalIntegerParam(input: Record<string, unknown>, name: string, defaultValue: number): number {
+  const value = input[name];
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    throw new ToolInputError(`${name} must be a non-negative integer when provided.`);
+  }
+  return value as number;
+}
+
 function positiveNumberParam(input: Record<string, unknown>, name: string): number {
   const value = numberParam(input, name);
   if (value < 1) {
@@ -301,6 +346,32 @@ function optionalStringParam(input: Record<string, unknown>, name: string): stri
     throw new ToolInputError(`${name} must be a non-empty string when provided.`);
   }
   return value;
+}
+
+function optionalEnumParam<T extends string>(input: Record<string, unknown>, name: string, values: readonly T[], defaultValue: T): T {
+  const value = input[name];
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== "string" || !values.includes(value as T)) {
+    throw new ToolInputError(`${name} must be one of: ${values.join(", ")}.`);
+  }
+  return value as T;
+}
+
+function optionalRoiParam(input: Record<string, unknown>, name: string): Bounds | undefined {
+  const value = input[name];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length !== 4 || !value.every((item) => Number.isInteger(item) && item >= 0)) {
+    throw new ToolInputError(`${name} must be [x1, y1, x2, y2] with non-negative integers.`);
+  }
+  const roi = value as Bounds;
+  if (roi[2] <= roi[0] || roi[3] <= roi[1]) {
+    throw new ToolInputError(`${name} must have x2 > x1 and y2 > y1.`);
+  }
+  return roi;
 }
 
 function optionalBooleanParam(input: Record<string, unknown>, name: string, defaultValue: boolean): boolean {
@@ -372,7 +443,7 @@ function parsePngSize(png: Buffer): { width: number; height: number } {
   };
 }
 
-async function androidScreenshot(input: unknown): Promise<ToolResult> {
+async function androidScreenshot(input: unknown): Promise<ScreenshotResult> {
   const params = optionalObject(input);
   const retain = optionalBooleanParam(params, "retain", false);
   const png = await adbBuffer(["exec-out", "screencap", "-p"], SCREENSHOT_TIMEOUT_MS);
@@ -384,6 +455,334 @@ async function androidScreenshot(input: unknown): Promise<ToolResult> {
   const imagePath = join(dir, "current-screen.png");
   await writeFile(imagePath, png);
   return { imagePath, width, height, retained: retain };
+}
+
+async function androidOcrScreen(input: unknown): Promise<ToolResult> {
+  const options = ocrOptions(input);
+  const screenshot = await androidScreenshot({ retain: options.retain });
+  const ocr = await runOcr(screenshot, options);
+  return {
+    ...screenshot,
+    roi: options.roi,
+    langs: options.langs,
+    minConfidence: options.minConfidence,
+    nodes: ocr.nodes.slice(0, options.maxNodes),
+    nodeCount: Math.min(ocr.nodes.length, options.maxNodes),
+    totalNodeCount: ocr.nodes.length,
+    ocrElapsedMs: ocr.elapsedMs,
+    ...(options.includeRawOcr ? { rawOcr: ocr.rawOcr } : {})
+  };
+}
+
+async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const options = ocrOptions(params);
+  const ocrMode = optionalEnumParam(params, "ocrMode", ["auto", "force", "off"] as const, "auto");
+  const includeScreenshot = optionalBooleanParam(params, "includeScreenshot", true);
+  const includeRawTree = optionalBooleanParam(params, "includeRawTree", false);
+
+  const [screenshot, compact] = await Promise.all([androidScreenshot({ retain: options.retain }), androidDumpCompact()]);
+  const accessibilityNodes = compactNodes(compact);
+  const tree = assessTreeUsability(compact, accessibilityNodes);
+  const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
+  const ocr = shouldRunOcr ? await runOcr(screenshot, options) : undefined;
+  const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], options.maxNodes);
+
+  return {
+    ...(includeScreenshot ? screenshot : {}),
+    packageName: compact.packageName,
+    width: includeScreenshot ? screenshot.width : compact.width,
+    height: includeScreenshot ? screenshot.height : compact.height,
+    ocrMode,
+    ocrUsed: shouldRunOcr,
+    ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
+    treeUsable: tree.usable,
+    accessibilityNodeCount: accessibilityNodes.length,
+    ocrNodeCount: ocr?.nodes.length ?? 0,
+    nodes,
+    nodeCount: nodes.length,
+    ...(includeRawTree ? { compactTree: compact } : {}),
+    ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {})
+  };
+}
+
+function ocrOptions(input: unknown): {
+  roi?: Bounds;
+  langs: string;
+  maxNodes: number;
+  minConfidence: number;
+  retain: boolean;
+  includeRawOcr: boolean;
+} {
+  const params = optionalObject(input);
+  const langs = optionalStringParam(params, "langs") ?? "chi_sim+eng";
+  const maxNodes = Math.max(1, optionalIntegerParam(params, "maxNodes", 80));
+  const minConfidence = Math.min(100, optionalIntegerParam(params, "minConfidence", 45));
+  return {
+    roi: optionalRoiParam(params, "roi"),
+    langs,
+    maxNodes,
+    minConfidence,
+    retain: optionalBooleanParam(params, "retain", false),
+    includeRawOcr: optionalBooleanParam(params, "includeRawOcr", false)
+  };
+}
+
+async function runOcr(
+  screenshot: ScreenshotResult,
+  options: { roi?: Bounds; langs: string; minConfidence: number }
+): Promise<{ nodes: SemanticNode[]; rawOcr: string; elapsedMs: number }> {
+  const start = performance.now();
+  const target = options.roi ? await cropImage(screenshot, options.roi) : { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
+  const rawOcr = await execText("tesseract", [target.imagePath, "stdout", "-l", options.langs, "--psm", "6", "tsv"], OCR_TIMEOUT_MS);
+  const words = parseTesseractTsv(rawOcr, options.minConfidence, target.offsetX, target.offsetY);
+  return {
+    nodes: mergeOcrWords(words),
+    rawOcr,
+    elapsedMs: Math.round(performance.now() - start)
+  };
+}
+
+async function cropImage(screenshot: ScreenshotResult, roi: Bounds): Promise<{ imagePath: string; offsetX: number; offsetY: number }> {
+  const x1 = Math.min(roi[0], screenshot.width - 1);
+  const y1 = Math.min(roi[1], screenshot.height - 1);
+  const x2 = Math.min(roi[2], screenshot.width);
+  const y2 = Math.min(roi[3], screenshot.height);
+  if (x2 <= x1 || y2 <= y1) {
+    throw new ToolInputError("roi falls outside the screenshot bounds.");
+  }
+
+  const width = x2 - x1;
+  const height = y2 - y1;
+  const dir = screenshot.retained ? await mkdtemp(join(tmpdir(), "android-ui-mcp-ocr-")) : join(tmpdir(), "android-ui-mcp");
+  await mkdir(dir, { recursive: true });
+  const cropPath = join(dir, "ocr-crop.png");
+  await execText("sips", ["-c", String(height), String(width), "--cropOffset", String(y1), String(x1), screenshot.imagePath, "--out", cropPath], DEFAULT_TIMEOUT_MS);
+  await stat(cropPath);
+  return { imagePath: cropPath, offsetX: x1, offsetY: y1 };
+}
+
+async function execText(command: string, args: string[], timeoutMs: number): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(command, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 32 * 1024 * 1024
+    });
+    return stdout;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { stdout?: string | Buffer; stderr?: string | Buffer; code?: string | number; killed?: boolean };
+    throw new Error(
+      `${command} ${args.join(" ")} failed${err.killed ? " because it timed out" : ""}: ${truncate(bufferishToString(err.stderr) || bufferishToString(err.stdout))}`
+    );
+  }
+}
+
+function parseTesseractTsv(tsv: string, minConfidence: number, offsetX: number, offsetY: number): OcrWord[] {
+  const lines = tsv.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length <= 1) {
+    return [];
+  }
+
+  const headers = lines[0].split("\t");
+  const indexes = {
+    block: headers.indexOf("block_num"),
+    paragraph: headers.indexOf("par_num"),
+    line: headers.indexOf("line_num"),
+    word: headers.indexOf("word_num"),
+    left: headers.indexOf("left"),
+    top: headers.indexOf("top"),
+    width: headers.indexOf("width"),
+    height: headers.indexOf("height"),
+    confidence: headers.indexOf("conf"),
+    text: headers.indexOf("text")
+  };
+  if (Object.values(indexes).some((index) => index < 0)) {
+    throw new Error("Tesseract TSV output is missing expected columns.");
+  }
+
+  const words: OcrWord[] = [];
+  for (const line of lines.slice(1)) {
+    const columns = line.split("\t");
+    const text = columns.slice(indexes.text).join("\t").trim();
+    const confidence = Number(columns[indexes.confidence]);
+    if (!Number.isFinite(confidence) || confidence < minConfidence || !isUsefulOcrText(text)) {
+      continue;
+    }
+    const left = Number(columns[indexes.left]) + offsetX;
+    const top = Number(columns[indexes.top]) + offsetY;
+    const width = Number(columns[indexes.width]);
+    const height = Number(columns[indexes.height]);
+    if (![left, top, width, height].every(Number.isFinite) || width < 2 || height < 2) {
+      continue;
+    }
+
+    words.push({
+      text,
+      confidence,
+      bounds: [left, top, left + width, top + height],
+      lineKey: `${columns[indexes.block]}:${columns[indexes.paragraph]}:${columns[indexes.line]}`
+    });
+  }
+  return words;
+}
+
+function isUsefulOcrText(text: string): boolean {
+  if (text.length === 0 || text.length > 160) {
+    return false;
+  }
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+function mergeOcrWords(words: OcrWord[]): SemanticNode[] {
+  const groups = new Map<string, OcrWord[]>();
+  for (const word of words) {
+    const group = groups.get(word.lineKey) ?? [];
+    group.push(word);
+    groups.set(word.lineKey, group);
+  }
+
+  const nodes: SemanticNode[] = [];
+  let index = 0;
+  for (const group of groups.values()) {
+    const sorted = group.sort((a, b) => a.bounds[0] - b.bounds[0]);
+    const text = sorted.map((word) => word.text).join(needsWordSpacing(sorted) ? " " : "").trim();
+    if (!isUsefulOcrText(text)) {
+      continue;
+    }
+    const bounds = unionBounds(sorted.map((word) => word.bounds));
+    const confidence = Math.round(sorted.reduce((sum, word) => sum + word.confidence, 0) / sorted.length);
+    nodes.push({
+      id: `ocr:${++index}`,
+      text: truncate(text, 80),
+      bounds,
+      center: boundsCenter(bounds),
+      clickable: true,
+      source: "ocr",
+      confidence
+    });
+  }
+
+  return dedupeSemanticNodes(nodes).sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0]);
+}
+
+function needsWordSpacing(words: OcrWord[]): boolean {
+  return words.some((word) => /[A-Za-z0-9]/.test(word.text));
+}
+
+function compactNodes(compact: Record<string, unknown>): SemanticNode[] {
+  const rawNodes = compact.nodes;
+  if (!Array.isArray(rawNodes)) {
+    return [];
+  }
+  const nodes: SemanticNode[] = [];
+  for (const [index, rawNode] of rawNodes.entries()) {
+    const node = expectObject(rawNode);
+    const boundsValue = optionalStringParam(node, "bounds");
+    const bounds = boundsValue ? parseBounds(boundsValue) : undefined;
+    if (!bounds) {
+      continue;
+    }
+    const text = optionalStringParam(node, "text");
+    const contentDesc = optionalStringParam(node, "contentDesc");
+    const resourceId = optionalStringParam(node, "resourceId");
+    const className = optionalStringParam(node, "className");
+    const actions = Array.isArray(node.actions) ? node.actions.filter((action): action is string => typeof action === "string") : undefined;
+    nodes.push({
+      id: `accessibility:${index + 1}`,
+      ...(text ? { text: truncate(text, 80) } : {}),
+      ...(contentDesc ? { contentDesc: truncate(contentDesc, 80) } : {}),
+      ...(resourceId ? { resourceId } : {}),
+      ...(className ? { className } : {}),
+      bounds,
+      center: boundsCenter(bounds),
+      ...(node.clickable === true ? { clickable: true } : {}),
+      ...(node.scrollable === true ? { scrollable: true } : {}),
+      ...(actions && actions.length > 0 ? { actions } : {}),
+      source: "accessibility"
+    });
+  }
+  return nodes;
+}
+
+function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNode[]): { usable: boolean; reason: string } {
+  const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
+  if (["com.tencent.mm"].includes(packageName)) {
+    return { usable: false, reason: "known_sparse_accessibility_app" };
+  }
+  if (nodes.length === 0) {
+    return { usable: false, reason: "no_accessibility_nodes" };
+  }
+
+  const readableOrActionable = nodes.filter(
+    (node) => node.text || node.contentDesc || node.clickable || node.scrollable || (node.actions && node.actions.length > 0)
+  );
+  const readable = nodes.filter((node) => node.text || node.contentDesc);
+  if (readable.length < 3) {
+    return { usable: false, reason: "sparse_tree" };
+  }
+  if (readableOrActionable.length === 0) {
+    return { usable: false, reason: "no_readable_or_actionable_nodes" };
+  }
+  return { usable: true, reason: "tree_usable" };
+}
+
+function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: SemanticNode[], maxNodes: number): SemanticNode[] {
+  const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes]);
+  return merged
+    .sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0] || sourceRank(a.source) - sourceRank(b.source))
+    .slice(0, maxNodes);
+}
+
+function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
+  const result: SemanticNode[] = [];
+  for (const node of nodes) {
+    const text = (node.text ?? node.contentDesc ?? "").trim().toLowerCase();
+    const duplicate = result.some((existing) => {
+      const existingText = (existing.text ?? existing.contentDesc ?? "").trim().toLowerCase();
+      return text.length > 0 && text === existingText && boundsOverlapRatio(node.bounds, existing.bounds) > 0.75;
+    });
+    if (!duplicate) {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+function sourceRank(source: SemanticNode["source"]): number {
+  return source === "accessibility" ? 0 : 1;
+}
+
+function parseBounds(value: string): Bounds | undefined {
+  const match = /^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/.exec(value);
+  if (!match) {
+    return undefined;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])];
+}
+
+function unionBounds(bounds: Bounds[]): Bounds {
+  return [
+    Math.min(...bounds.map((bound) => bound[0])),
+    Math.min(...bounds.map((bound) => bound[1])),
+    Math.max(...bounds.map((bound) => bound[2])),
+    Math.max(...bounds.map((bound) => bound[3]))
+  ];
+}
+
+function boundsCenter(bounds: Bounds): [number, number] {
+  return [Math.round((bounds[0] + bounds[2]) / 2), Math.round((bounds[1] + bounds[3]) / 2)];
+}
+
+function boundsOverlapRatio(left: Bounds, right: Bounds): number {
+  const x1 = Math.max(left[0], right[0]);
+  const y1 = Math.max(left[1], right[1]);
+  const x2 = Math.min(left[2], right[2]);
+  const y2 = Math.min(left[3], right[3]);
+  const overlap = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const leftArea = Math.max(1, (left[2] - left[0]) * (left[3] - left[1]));
+  const rightArea = Math.max(1, (right[2] - right[0]) * (right[3] - right[1]));
+  return overlap / Math.min(leftArea, rightArea);
 }
 
 async function androidDumpTree(): Promise<ToolResult> {
@@ -670,6 +1069,21 @@ function normalizeAndroidApp(value: unknown): AndroidApp {
 
 const integerSchema = { type: "integer", minimum: 0 };
 const positiveIntegerSchema = { type: "integer", minimum: 1 };
+const roiSchema = {
+  type: "array",
+  minItems: 4,
+  maxItems: 4,
+  items: integerSchema,
+  description: "Optional OCR region as [x1, y1, x2, y2] in screenshot coordinates."
+};
+const ocrCommonProperties = {
+  roi: roiSchema,
+  langs: { type: "string", minLength: 1, default: "chi_sim+eng" },
+  maxNodes: { type: "integer", minimum: 1, default: 80 },
+  minConfidence: { type: "integer", minimum: 0, maximum: 100, default: 45 },
+  retain: { type: "boolean", default: false },
+  includeRawOcr: { type: "boolean", default: false }
+};
 const selectorSchema = {
   type: "object",
   properties: {
@@ -711,6 +1125,31 @@ const tools: ToolDefinition[] = [
       additionalProperties: false
     },
     handler: androidScreenshot
+  },
+  {
+    name: "android_ocr_screen",
+    description: "Run local Tesseract OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
+    inputSchema: {
+      type: "object",
+      properties: ocrCommonProperties,
+      additionalProperties: false
+    },
+    handler: androidOcrScreen
+  },
+  {
+    name: "android_get_semantic_screen",
+    description: "Return a unified compact screen model from accessibility nodes, with optional or automatic OCR fallback for sparse trees.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ocrMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
+        includeScreenshot: { type: "boolean", default: true },
+        includeRawTree: { type: "boolean", default: false },
+        ...ocrCommonProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidGetSemanticScreen
   },
   {
     name: "android_dump_tree",
@@ -761,7 +1200,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_input_text",
-    description: "Input text into the focused field with adb shell input text, or edit a matching node by selector with accessibility set_text.",
+    description: "Set text into the focused field, or edit a matching node by selector, through accessibility set_text.",
     inputSchema: {
       type: "object",
       required: ["text"],

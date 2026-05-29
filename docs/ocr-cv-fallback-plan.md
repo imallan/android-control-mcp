@@ -11,11 +11,11 @@ Confirmed local dependencies:
 - macOS `sips` for lightweight crop and resize operations
 - No current Python CV, PIL, or OpenCV dependency; v1 should avoid large model or Python image-stack requirements
 
-## Proposed Tools
+## Tools
 
 ### `android_get_semantic_screen`
 
-Run screenshot capture, compact accessibility dump, sparse-tree detection, and OCR fallback when needed.
+Runs screenshot capture, compact accessibility dump, sparse-tree detection, and OCR fallback when needed.
 
 Example response:
 
@@ -75,7 +75,7 @@ Treat the accessibility tree as sparse when any of these are true:
 
 ## Local OCR Implementation
 
-Use Tesseract TSV output:
+The initial implementation uses Tesseract TSV output:
 
 ```sh
 tesseract image stdout -l chi_sim+eng --psm 6 tsv
@@ -106,8 +106,8 @@ When `retain: true`, keep screenshots and crops in a unique temp directory.
 - Deduplicate repeated text and highly overlapping bounds.
 - Prefer OCR over targeted regions such as the top bar, bottom navigation, and visible content area.
 - Use full-screen OCR only when targeted OCR is insufficient.
-- Cache the last OCR result by screenshot path and modification time.
-- Invalidate the cache after any action that changes UI state.
+- Cache the last OCR result by screenshot path and modification time. This is planned, not implemented in the initial version.
+- Invalidate the cache after any action that changes UI state. This is planned, not implemented in the initial version.
 
 ## Test Plan
 

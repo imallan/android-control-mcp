@@ -6,6 +6,8 @@ on-device bridge, exposed over MCP stdio:
 - `android_bridge_ping`: verify that the on-device bridge is reachable
 - `android_bridge_exit`: stop the on-device bridge
 - `android_screenshot`: overwrites one stable temp file by default; pass `retain=true` to keep a unique screenshot
+- `android_ocr_screen`: run local Tesseract OCR on the current screenshot and return compact OCR nodes
+- `android_get_semantic_screen`: return accessibility nodes with automatic or forced OCR fallback
 - `android_dump_tree`: XML hierarchy from the on-device bridge
 - `android_dump_compact`: compact node list from the on-device bridge
 - `android_tap`
@@ -44,6 +46,7 @@ Optional environment variables:
 - `ANDROID_SERIAL`: target device serial
 - `ANDROID_MCP_ADB_TIMEOUT_MS`: default ADB command timeout, default `15000`
 - `ANDROID_MCP_SCREENSHOT_TIMEOUT_MS`: screenshot timeout, default `20000`
+- `ANDROID_MCP_OCR_TIMEOUT_MS`: local OCR command timeout, default `30000`
 - `ANDROID_UI_MCP_HOST`: bridge host, default `127.0.0.1`
 - `ANDROID_UI_MCP_PORT`: bridge/adb-forward port, default `27183`
 - `ANDROID_UI_MCP_TIMEOUT_MS`: bridge request timeout, default `15000`
@@ -91,7 +94,9 @@ Restart or reload Codex after installation so it discovers the tools.
 ## Transport Notes
 
 - `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
-- `android_screenshot` still uses direct ADB because the Android bridge does not yet expose screenshot capture.
+- `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
+- `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
+- `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` require local `tesseract` on `PATH`.
 - The MCP server refreshes `adb forward tcp:$ANDROID_UI_MCP_PORT localabstract:android-ui-mcp` before each bridge call.
 
 ## Limitations

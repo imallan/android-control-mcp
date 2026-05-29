@@ -32,6 +32,13 @@ Bridge-backed tools:
 ADB-backed tools:
 
 - `android_screenshot`
+- `android_ocr_screen`
+
+Hybrid tools:
+
+- `android_get_semantic_screen`
+
+`android_get_semantic_screen` uses both screenshot capture and the bridge-backed compact tree. It can run OCR automatically when the accessibility tree is sparse.
 
 ## Core Implementation
 
@@ -52,6 +59,7 @@ Important behavior:
 - MCP transport is stdio with direct JSON-RPC handling.
 - The desktop server refreshes `adb forward` before bridge calls.
 - Screenshots use `adb exec-out screencap -p`.
+- OCR uses local `tesseract` TSV output from the desktop MCP process.
 - Compact accessibility nodes are collected directly from `AccessibilityNodeInfo`.
 - XML hierarchy dumps are still available for debugging and compatibility.
 - Text input prefers accessibility `ACTION_SET_TEXT` through the bridge.
@@ -122,16 +130,15 @@ Previously verified behavior:
 - `uiautomator` exposes the accessibility tree, not the full rendered view tree.
 - WebView, OpenGL, game, video, and some Compose screens may expose little or no useful accessibility data.
 - `FLAG_SECURE` windows can block screenshots.
-- OCR/CV fallback is planned but not implemented.
+- The OCR fallback is text-only. It does not detect icon-only buttons or visual grouping.
 - Automated tests are still minimal.
 
 ## Recommended Next Work
 
 Highest priority:
 
-- Implement OCR/CV fallback from `docs/ocr-cv-fallback-plan.md`.
-- Add `android_get_semantic_screen` as the default screen-understanding tool.
-- Add `android_ocr_screen` as a debugging and fallback tool.
+- Test OCR fallback on real weak-accessibility apps such as WeChat.
+- Improve OCR region selection and merging heuristics after real-device runs.
 
 Hardening:
 

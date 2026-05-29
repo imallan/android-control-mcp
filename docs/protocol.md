@@ -8,6 +8,7 @@ Bridge-backed MCP tools:
 
 - `android_bridge_ping`
 - `android_bridge_exit`
+- `android_get_semantic_screen`
 - `android_dump_tree`
 - `android_dump_compact`
 - `android_tap`
@@ -22,6 +23,13 @@ Bridge-backed MCP tools:
 ADB-backed MCP tools:
 
 - `android_screenshot`
+- `android_ocr_screen`
+
+`android_get_semantic_screen` combines ADB screenshot capture with bridge-backed compact tree access. Its `ocrMode` parameter controls OCR fallback:
+
+- `auto`: run OCR only when the accessibility tree is sparse or known to be unreliable.
+- `force`: always run OCR and merge OCR nodes with accessibility nodes.
+- `off`: return accessibility nodes only.
 
 ## Android Bridge
 
