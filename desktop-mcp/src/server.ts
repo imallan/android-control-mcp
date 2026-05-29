@@ -4,7 +4,8 @@ import { access, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -23,6 +24,8 @@ type ToolResult = Record<string, unknown>;
 type Bounds = [number, number, number, number];
 
 type OcrMode = "auto" | "force" | "off";
+
+type OcrEngine = "tesseract" | "apple-vision";
 
 type SemanticNode = {
   id: string;
@@ -84,10 +87,14 @@ type ToolDefinition = {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_ADB_TIMEOUT_MS ?? 15_000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_SCREENSHOT_TIMEOUT_MS ?? 20_000);
-const OCR_TIMEOUT_MS = Number(process.env.ANDROID_MCP_OCR_TIMEOUT_MS ?? 30_000);
+const OCR_TIMEOUT_MS = Number(process.env.ANDROID_MCP_OCR_TIMEOUT_MS ?? 90_000);
 const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const APPLE_VISION_OCR_SOURCE = join(MODULE_DIR, "..", "apple-vision-ocr.swift");
+const APPLE_VISION_OCR_BIN = process.env.ANDROID_MCP_APPLE_VISION_OCR_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-ocr");
+const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-cache");
 
 const KEYCODES: Record<string, string> = {
   BACK: "KEYCODE_BACK",
@@ -471,6 +478,7 @@ async function androidOcrScreen(input: unknown): Promise<ToolResult> {
     roi: options.roi,
     langs: options.langs,
     minConfidence: options.minConfidence,
+    ocrEngine: options.ocrEngine,
     nodes: ocr.nodes.slice(0, options.maxNodes),
     nodeCount: Math.min(ocr.nodes.length, options.maxNodes),
     totalNodeCount: ocr.nodes.length,
@@ -502,6 +510,7 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
     height: includeScreenshot ? screenshot.height : compact.height,
     ocrMode,
     ocrUsed: shouldRunOcr,
+    ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
     ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
     treeUsable: tree.usable,
     accessibilityNodeCount: accessibilityNodes.length,
@@ -516,6 +525,7 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
 function ocrOptions(input: unknown): {
   roi?: Bounds;
   langs: string;
+  ocrEngine: OcrEngine;
   maxNodes: number;
   minConfidence: number;
   retain: boolean;
@@ -523,11 +533,13 @@ function ocrOptions(input: unknown): {
 } {
   const params = optionalObject(input);
   const langs = optionalStringParam(params, "langs") ?? "chi_sim+eng";
+  const ocrEngine = optionalEnumParam(params, "ocrEngine", ["tesseract", "apple-vision"] as const, "apple-vision");
   const maxNodes = Math.max(1, optionalIntegerParam(params, "maxNodes", 80));
   const minConfidence = Math.min(100, optionalIntegerParam(params, "minConfidence", 45));
   return {
     roi: optionalRoiParam(params, "roi"),
     langs,
+    ocrEngine,
     maxNodes,
     minConfidence,
     retain: optionalBooleanParam(params, "retain", false),
@@ -537,30 +549,154 @@ function ocrOptions(input: unknown): {
 
 async function runOcr(
   screenshot: ScreenshotResult,
-  options: { roi?: Bounds; langs: string; minConfidence: number }
+  options: { roi?: Bounds; langs: string; ocrEngine: OcrEngine; minConfidence: number }
 ): Promise<{ nodes: SemanticNode[]; rawOcr: string; elapsedMs: number }> {
   const start = performance.now();
   const target = options.roi ? await cropImage(screenshot, options.roi) : { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
-  const rawOcr = await execText("tesseract", [target.imagePath, "stdout", "-l", options.langs, "--psm", "6", "tsv"], OCR_TIMEOUT_MS);
-  const words = parseTesseractTsv(rawOcr, options.minConfidence, target.offsetX, target.offsetY);
+  const result =
+    options.ocrEngine === "apple-vision"
+      ? await runAppleVisionOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY)
+      : await runTesseractOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY);
   return {
-    nodes: mergeOcrWords(words),
-    rawOcr,
+    nodes: result.nodes,
+    rawOcr: result.rawOcr,
     elapsedMs: Math.round(performance.now() - start)
   };
 }
 
+async function runTesseractOcr(
+  imagePath: string,
+  langs: string,
+  minConfidence: number,
+  offsetX: number,
+  offsetY: number
+): Promise<{ nodes: SemanticNode[]; rawOcr: string }> {
+  const rawOcr = await execText("tesseract", [imagePath, "stdout", "-l", langs, "--psm", "6", "tsv"], OCR_TIMEOUT_MS);
+  const words = parseTesseractTsv(rawOcr, minConfidence, offsetX, offsetY);
+  return { nodes: mergeOcrWords(words), rawOcr };
+}
+
+async function runAppleVisionOcr(
+  imagePath: string,
+  langs: string,
+  minConfidence: number,
+  offsetX: number,
+  offsetY: number
+): Promise<{ nodes: SemanticNode[]; rawOcr: string }> {
+  const bin = await ensureAppleVisionOcrBin();
+  const visionLangs = appleVisionLanguages(langs).join(",");
+  const rawOcr = await execText(bin, [imagePath, "--langs", visionLangs], OCR_TIMEOUT_MS);
+  return { nodes: parseAppleVisionOcr(rawOcr, minConfidence, offsetX, offsetY), rawOcr };
+}
+
+async function ensureAppleVisionOcrBin(): Promise<string> {
+  try {
+    await access(APPLE_VISION_OCR_BIN);
+    return APPLE_VISION_OCR_BIN;
+  } catch {
+    await mkdir(dirname(APPLE_VISION_OCR_BIN), { recursive: true });
+    await mkdir(CLANG_MODULE_CACHE_DIR, { recursive: true });
+    await execText("swiftc", [APPLE_VISION_OCR_SOURCE, "-o", APPLE_VISION_OCR_BIN], OCR_TIMEOUT_MS);
+    return APPLE_VISION_OCR_BIN;
+  }
+}
+
+function appleVisionLanguages(langs: string): string[] {
+  const requested = langs
+    .split(/[+,]/)
+    .map((lang) => lang.trim())
+    .filter(Boolean);
+  const mapped = requested.map((lang) => {
+      switch (lang) {
+        case "chi_sim":
+        case "zh":
+        case "zh_CN":
+        case "zh-CN":
+          return "zh-Hans";
+        case "chi_tra":
+        case "zh_TW":
+        case "zh-TW":
+          return "zh-Hant";
+        case "eng":
+        case "en":
+          return "en-US";
+        default:
+          return lang;
+      }
+    });
+  if (requested.some((lang) => ["chi_sim", "zh", "zh_CN", "zh-CN", "zh-Hans"].includes(lang))) {
+    return ["zh-Hans"];
+  }
+  if (requested.some((lang) => ["chi_tra", "zh_TW", "zh-TW", "zh-Hant"].includes(lang))) {
+    return ["zh-Hant"];
+  }
+  return mapped.length > 0 ? Array.from(new Set(mapped)) : ["zh-Hans", "en-US"];
+}
+
+function parseAppleVisionOcr(rawOcr: string, minConfidence: number, offsetX: number, offsetY: number): SemanticNode[] {
+  const parsed = expectObject(JSON.parse(rawOcr));
+  const rawNodes = parsed.nodes;
+  if (!Array.isArray(rawNodes)) {
+    throw new Error("Apple Vision OCR output did not include nodes.");
+  }
+
+  const nodes: SemanticNode[] = [];
+  for (const [index, rawNode] of rawNodes.entries()) {
+    const node = expectObject(rawNode);
+    const text = optionalStringParam(node, "text");
+    const confidence = numberParam(node, "confidence");
+    const rawBounds = node.bounds;
+    if (!text || confidence < minConfidence || !isUsefulOcrText(text)) {
+      continue;
+    }
+    if (!Array.isArray(rawBounds) || rawBounds.length !== 4 || !rawBounds.every((value) => Number.isInteger(value) && value >= 0)) {
+      continue;
+    }
+    const bounds: Bounds = [
+      (rawBounds[0] as number) + offsetX,
+      (rawBounds[1] as number) + offsetY,
+      (rawBounds[2] as number) + offsetX,
+      (rawBounds[3] as number) + offsetY
+    ];
+    nodes.push({
+      id: `ocr:${index + 1}`,
+      text: truncate(text, 80),
+      bounds,
+      center: boundsCenter(bounds),
+      clickable: true,
+      source: "ocr",
+      confidence
+    });
+  }
+
+  return dedupeSemanticNodes(nodes).sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0]);
+}
+
 async function cropImage(screenshot: ScreenshotResult, roi: Bounds): Promise<{ imagePath: string; offsetX: number; offsetY: number }> {
-  const x1 = Math.min(roi[0], screenshot.width - 1);
-  const y1 = Math.min(roi[1], screenshot.height - 1);
+  if (roi[0] === 0 && roi[1] === 0 && roi[2] >= screenshot.width && roi[3] >= screenshot.height) {
+    return { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
+  }
+
+  let x1 = Math.min(roi[0], screenshot.width - 1);
+  let y1 = Math.min(roi[1], screenshot.height - 1);
   const x2 = Math.min(roi[2], screenshot.width);
   const y2 = Math.min(roi[3], screenshot.height);
-  if (x2 <= x1 || y2 <= y1) {
+  let width = x2 - x1;
+  let height = y2 - y1;
+  if (width <= 0 || height <= 0) {
     throw new ToolInputError("roi falls outside the screenshot bounds.");
   }
 
-  const width = x2 - x1;
-  const height = y2 - y1;
+  // sips may skip cropping when the crop offset lands exactly on the bottom/right edge.
+  // Shift the crop inward by one pixel in that case; the OCR coordinate offset remains
+  // accurate enough for click-center estimation.
+  if (x1 > 0 && x1 + width >= screenshot.width) {
+    x1 = Math.max(0, screenshot.width - width - 1);
+  }
+  if (y1 > 0 && y1 + height >= screenshot.height) {
+    y1 = Math.max(0, screenshot.height - height - 1);
+  }
+
   const dir = screenshot.retained ? await mkdtemp(join(tmpdir(), "android-ui-mcp-ocr-")) : join(tmpdir(), "android-ui-mcp");
   await mkdir(dir, { recursive: true });
   const cropPath = join(dir, "ocr-crop.png");
@@ -574,6 +710,7 @@ async function execText(command: string, args: string[], timeoutMs: number): Pro
     const { stdout } = await execFileAsync(command, args, {
       encoding: "utf8",
       timeout: timeoutMs,
+      env: { ...process.env, CLANG_MODULE_CACHE_PATH: CLANG_MODULE_CACHE_DIR },
       maxBuffer: 32 * 1024 * 1024
     });
     return stdout;
@@ -1189,6 +1326,7 @@ const roiSchema = {
 const ocrCommonProperties = {
   roi: roiSchema,
   langs: { type: "string", minLength: 1, default: "chi_sim+eng" },
+  ocrEngine: { type: "string", enum: ["tesseract", "apple-vision"], default: "apple-vision" },
   maxNodes: { type: "integer", minimum: 1, default: 80 },
   minConfidence: { type: "integer", minimum: 0, maximum: 100, default: 45 },
   retain: { type: "boolean", default: false },
@@ -1238,7 +1376,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_ocr_screen",
-    description: "Run local Tesseract OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
+    description: "Run local OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
     inputSchema: {
       type: "object",
       properties: ocrCommonProperties,

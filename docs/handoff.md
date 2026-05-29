@@ -59,7 +59,8 @@ Important behavior:
 - MCP transport is stdio with direct JSON-RPC handling.
 - The desktop server refreshes `adb forward` before bridge calls.
 - Screenshots use `adb exec-out screencap -p`.
-- OCR uses local `tesseract` TSV output from the desktop MCP process.
+- OCR supports local Tesseract TSV output and Apple Vision through `desktop-mcp/apple-vision-ocr.swift`.
+- Apple Vision is the default OCR backend and is macOS-only. Tesseract remains available with `ocrEngine: "tesseract"`.
 - Compact accessibility nodes are collected directly from `AccessibilityNodeInfo`.
 - XML hierarchy dumps are still available for debugging and compatibility.
 - Text input prefers accessibility `ACTION_SET_TEXT` through the bridge.
@@ -131,6 +132,7 @@ Previously verified behavior:
 - WebView, OpenGL, game, video, and some Compose screens may expose little or no useful accessibility data.
 - `FLAG_SECURE` windows can block screenshots.
 - The OCR fallback is text-only. It does not detect icon-only buttons or visual grouping.
+- Apple Vision quality is much better for Chinese UI text than Tesseract in early tests, but it requires macOS and system language support.
 - Automated tests are still minimal.
 
 ## Recommended Next Work

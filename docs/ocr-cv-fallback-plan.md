@@ -8,6 +8,7 @@ Confirmed local dependencies:
 
 - `tesseract`
 - OCR language packs: `chi_sim`, `chi_tra`, and `eng`
+- Apple Vision through a local Swift helper on macOS
 - macOS `sips` for lightweight crop and resize operations
 - No current Python CV, PIL, or OpenCV dependency; v1 should avoid large model or Python image-stack requirements
 
@@ -97,6 +98,8 @@ Use `sips` to create ROI crops. By default, temporary crops should overwrite:
 ```
 
 When `retain: true`, keep screenshots and crops in a unique temp directory.
+
+The Apple Vision implementation uses `desktop-mcp/apple-vision-ocr.swift`, compiled on first use with `swiftc`. It returns JSON nodes with text, confidence, and pixel bounds. Apple Vision is the default OCR backend. For Chinese UI screenshots, `langs: "chi_sim+eng"` is mapped to Apple Vision's `zh-Hans` because mixed `zh-Hans,en-US` recognition produced worse Chinese output in early testing.
 
 ## Performance And Token Strategy
 

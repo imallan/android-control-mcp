@@ -6,3 +6,4 @@
 - OEM ROMs may alter shell output, break `uiautomator`, or restrict input injection.
 - Accessibility `ACTION_SET_TEXT` is more reliable than `adb shell input text`, but text input still depends on each target node supporting editable accessibility actions.
 - Apps with sparse accessibility trees can use OCR fallback for visible text and estimated click centers, but icon-only controls and visual grouping are not detected yet.
+- `ocrEngine: "apple-vision"` is macOS-only and depends on Apple Vision's installed language support.
