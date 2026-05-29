@@ -25,15 +25,24 @@ The script delegates to the repository Gradle wrapper:
 ./gradlew :android-server:buildUiautomatorJar
 ```
 
-The Gradle task still uses the local Android SDK directly:
+The Gradle task uses the local Android SDK directly, but it now auto-discovers the latest
+installed platform/build-tools when environment variables are not set.
 
-- `platforms/android-36/android.jar`
-- `platforms/android-36/uiautomator.jar`
-- `build-tools/37.0.0/d8`
+Resolution order:
+
+- `ANDROID_SDK_ROOT`
+- `ANDROID_HOME`
+- `local.properties` `sdk.dir`
+- `~/Library/Android/sdk` on macOS as a last resort
+
+It then picks:
+
+- the newest `platforms/android-*/android.jar` + `uiautomator.jar` pair
+- the newest `build-tools/*/d8`
 - Android Studio's bundled Kotlin compiler by default:
   `/Applications/Android Studio.app/Contents/plugins/Kotlin/kotlinc/bin/kotlinc`
 
-Override with:
+Override explicitly with:
 
 ```sh
 ANDROID_SDK_ROOT=/path/to/sdk ANDROID_PLATFORM=android-36.1 ANDROID_BUILD_TOOLS=36.1.0 KOTLINC=/path/to/kotlinc \

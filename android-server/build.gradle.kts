@@ -1,12 +1,83 @@
 import org.gradle.api.GradleException
 import org.gradle.api.tasks.Delete
 import org.gradle.api.tasks.Exec
+import java.util.Properties
 
-val sdkRoot: String =
-  providers.environmentVariable("ANDROID_HOME")
-    .orElse(providers.environmentVariable("ANDROID_SDK_ROOT"))
-    .orElse("/Volumes/数据/Android/sdk")
-    .get()
+data class VersionedDirectory(val dir: File, val numbers: List<Int>, val suffix: String)
+
+fun readLocalProperties(): Properties {
+  val properties = Properties()
+  val localPropertiesFile = file("local.properties")
+  if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { properties.load(it) }
+  }
+  return properties
+}
+
+fun parseVersion(name: String, prefix: String): VersionedDirectory? {
+  if (!name.startsWith(prefix)) {
+    return null
+  }
+
+  val rawVersion = name.removePrefix(prefix)
+  val numericPrefix = rawVersion.takeWhile { it.isDigit() || it == '.' }
+  if (numericPrefix.isEmpty()) {
+    return null
+  }
+
+  val suffix = rawVersion.removePrefix(numericPrefix).trimStart('-', '_')
+  val numbers = numericPrefix.split('.').map { it.toIntOrNull() ?: 0 }
+  return VersionedDirectory(File(name), numbers, suffix)
+}
+
+fun compareVersions(left: VersionedDirectory, right: VersionedDirectory): Int {
+  val maxSize = maxOf(left.numbers.size, right.numbers.size)
+  for (index in 0 until maxSize) {
+    val leftPart = left.numbers.getOrElse(index) { 0 }
+    val rightPart = right.numbers.getOrElse(index) { 0 }
+    if (leftPart != rightPart) {
+      return leftPart.compareTo(rightPart)
+    }
+  }
+
+  val leftIsStable = left.suffix.isEmpty()
+  val rightIsStable = right.suffix.isEmpty()
+  if (leftIsStable != rightIsStable) {
+    return if (leftIsStable) 1 else -1
+  }
+
+  return left.suffix.compareTo(right.suffix)
+}
+
+fun resolveSdkRoot(): File {
+  val localPropertiesSdkDir = readLocalProperties().getProperty("sdk.dir")?.trim()?.takeIf { it.isNotEmpty() }?.let(::File)
+  val candidates = listOfNotNull(
+    providers.environmentVariable("ANDROID_SDK_ROOT").orNull?.trim()?.takeIf { it.isNotEmpty() }?.let(::File),
+    providers.environmentVariable("ANDROID_HOME").orNull?.trim()?.takeIf { it.isNotEmpty() }?.let(::File),
+    localPropertiesSdkDir,
+    File(System.getProperty("user.home"), "Library/Android/sdk")
+  )
+
+  return candidates.firstOrNull { it.exists() } ?: throw GradleException(
+    "Android SDK not found. Set ANDROID_SDK_ROOT or ANDROID_HOME, or define sdk.dir in local.properties."
+  )
+}
+
+fun resolveLatestDirectory(root: File, prefix: String, requiredFiles: List<String>): File? {
+  val directories = root.listFiles()
+    ?.asSequence()
+    ?.filter { it.isDirectory }
+    ?.filter { directory -> requiredFiles.all { directory.resolve(it).exists() } }
+    ?.mapNotNull { directory ->
+      parseVersion(directory.name, prefix)?.copy(dir = directory)
+    }
+    ?.toList()
+    .orEmpty()
+
+  return directories.maxWithOrNull(::compareVersions)?.dir
+}
+
+val sdkRoot = resolveSdkRoot()
 
 val androidPlatform: String =
   providers.environmentVariable("ANDROID_PLATFORM")
@@ -15,7 +86,7 @@ val androidPlatform: String =
 
 val androidBuildTools: String =
   providers.environmentVariable("ANDROID_BUILD_TOOLS")
-    .orElse("37.0.0")
+    .orElse("")
     .get()
 
 val defaultKotlinc = "/Applications/Android Studio.app/Contents/plugins/Kotlin/kotlinc/bin/kotlinc"
@@ -24,9 +95,30 @@ val kotlincPath: String =
     .orElse(defaultKotlinc)
     .get()
 
-val androidJar = file("$sdkRoot/platforms/$androidPlatform/android.jar")
-val uiautomatorJar = file("$sdkRoot/platforms/$androidPlatform/uiautomator.jar")
-val d8 = file("$sdkRoot/build-tools/$androidBuildTools/d8")
+val platformDir =
+  if (providers.environmentVariable("ANDROID_PLATFORM").orNull.isNullOrBlank()) {
+    resolveLatestDirectory(sdkRoot.resolve("platforms"), "android-", listOf("android.jar", "uiautomator.jar"))
+      ?: throw GradleException(
+        "Android platform not found under ${sdkRoot.resolve("platforms").path}. Set ANDROID_PLATFORM explicitly."
+      )
+  } else {
+    sdkRoot.resolve("platforms").resolve(androidPlatform)
+  }
+
+val buildToolsDir =
+  if (providers.environmentVariable("ANDROID_BUILD_TOOLS").orNull.isNullOrBlank()) {
+    val latest = resolveLatestDirectory(sdkRoot.resolve("build-tools"), "", listOf("d8"))
+      ?: throw GradleException(
+        "No build-tools installation with d8 found under ${sdkRoot.resolve("build-tools").path}. Install Android build-tools or set ANDROID_BUILD_TOOLS."
+      )
+    latest
+  } else {
+    sdkRoot.resolve("build-tools").resolve(androidBuildTools)
+  }
+
+val androidJar = platformDir.resolve("android.jar")
+val uiautomatorJar = platformDir.resolve("uiautomator.jar")
+val d8 = buildToolsDir.resolve("d8")
 val kotlinc = file(kotlincPath)
 val kotlinHome = kotlinc.parentFile.parentFile
 val kotlinStdlib = file("${kotlinHome.path}/lib/kotlin-stdlib.jar")
