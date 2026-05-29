@@ -12,6 +12,11 @@ on-device bridge, exposed over MCP stdio:
 - `android_dump_compact`: compact node list from the on-device bridge
 - `android_tap`
 - `android_tap_ref`: tap an accessibility node from a semantic snapshot by `snapshotId` + `ref`
+- `android_fill_ref`: fill an editable accessibility node from a semantic snapshot by `snapshotId` + `ref`
+- `android_tap_text`
+- `android_tap_content_desc`
+- `android_click`
+- `android_fill_near_label`
 - `android_swipe`
 - `android_input_text`
 - `android_key`
@@ -95,7 +100,7 @@ Restart or reload Codex after installation so it discovers the tools.
 
 ## Transport Notes
 
-- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
+- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
 - `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
 - `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
 - `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.

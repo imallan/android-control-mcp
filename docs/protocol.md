@@ -13,6 +13,11 @@ Bridge-backed MCP tools:
 - `android_dump_compact`
 - `android_tap`
 - `android_tap_ref`
+- `android_fill_ref`
+- `android_tap_text`
+- `android_tap_content_desc`
+- `android_click`
+- `android_fill_near_label`
 - `android_swipe`
 - `android_input_text`
 - `android_key`
@@ -66,6 +71,17 @@ Behavior:
 - `stale_ref_ambiguous`: the screen changed and multiple current accessibility nodes matched, so no tap was sent.
 
 Relocation only considers accessibility nodes. OCR nodes can help the agent understand a sparse screen, but they are not action targets for `android_tap_ref` in v1.
+
+`android_fill_ref` uses the same `snapshotId` + `ref` stale handling as `android_tap_ref`, but only fills nodes that resolve to `editable: true` or `role: "textbox"`. It sends accessibility `inputText` with a selector derived from the resolved node and rejects OCR refs.
+
+Convenience actions operate on the current accessibility snapshot and do not use OCR nodes as action targets:
+
+- `android_tap_text`: taps the unique node matching `text`, with optional `role` and `fuzzy`.
+- `android_tap_content_desc`: taps the unique node matching `contentDesc`, with optional `role` and `fuzzy`.
+- `android_click`: taps the unique node matching a small locator containing any of `resourceId`, `text`, `contentDesc`, `role`, or `className`.
+- `android_fill_near_label`: fills the unique editable node spatially associated with a unique label.
+
+If a convenience action finds no match, it returns `success: false` with a `*_not_found` status and the current snapshot. If multiple nodes match, it returns `success: false` with a `*_ambiguous` status and candidate refs, without sending an input event.
 
 OCR-backed tools accept `ocrEngine`:
 

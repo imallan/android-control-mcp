@@ -602,8 +602,10 @@ class BridgeTest : UiAutomatorTestCase() {
 
       val text = node.text?.toString().orEmpty()
       val contentDesc = node.contentDescription?.toString().orEmpty()
+      val actions = node.actionList
+        .mapNotNull { action -> actionLabel(action.id, action.label?.toString()) }
       val hasReadableText = text.isNotEmpty() || contentDesc.isNotEmpty()
-      val hasAction = node.isClickable || node.isScrollable
+      val hasAction = node.isClickable || node.isScrollable || actions.isNotEmpty()
 
       if (hasReadableText || hasAction) {
         val bounds = Rect()
@@ -616,8 +618,6 @@ class BridgeTest : UiAutomatorTestCase() {
         compact["bounds"] = rectToString(bounds)
         if (node.isClickable) compact["clickable"] = true
         if (node.isScrollable) compact["scrollable"] = true
-        val actions = node.actionList
-          .mapNotNull { action -> actionLabel(action.id, action.label?.toString()) }
         if (actions.isNotEmpty()) {
           compact["actions"] = actions
         }

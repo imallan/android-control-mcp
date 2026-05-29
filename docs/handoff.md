@@ -21,6 +21,12 @@ Bridge-backed tools:
 - `android_dump_tree`
 - `android_dump_compact`
 - `android_tap`
+- `android_tap_ref`
+- `android_fill_ref`
+- `android_tap_text`
+- `android_tap_content_desc`
+- `android_click`
+- `android_fill_near_label`
 - `android_swipe`
 - `android_input_text`
 - `android_perform_action`
