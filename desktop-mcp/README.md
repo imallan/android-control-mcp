@@ -106,6 +106,7 @@ Restart or reload Codex after installation so it discovers the tools.
 
 - `android_current_app`, `android_wait_for_package`, `android_wait_for_text`, `android_wait_for_screen_change`, `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
 - `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
+- High-level ref and locator action tools default to returning a post-action snapshot after waiting up to 1500 ms for strict or actionable accessibility stability.
 - `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
 - `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
 - The Apple Vision engine is the default OCR backend on this MCP.

@@ -49,6 +49,7 @@ type SemanticNode = {
 type SemanticSnapshot = {
   snapshotId: string;
   screenSignature: string;
+  actionableSignature: string;
   packageName?: string;
   width?: number;
   height?: number;
@@ -143,6 +144,8 @@ const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-ca
 const SNAPSHOT_CACHE_LIMIT = 20;
 const DEFAULT_WAIT_TIMEOUT_MS = 5_000;
 const DEFAULT_WAIT_POLL_INTERVAL_MS = 300;
+const DEFAULT_STABLE_TIMEOUT_MS = 1_500;
+const DEFAULT_STABLE_POLL_INTERVAL_MS = 150;
 
 const snapshotCache = new Map<string, SnapshotCacheEntry>();
 
@@ -557,6 +560,7 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
     ...(includeScreenshot ? screenshot : {}),
     snapshotId: snapshot.snapshotId,
     screenSignature: snapshot.screenSignature,
+    actionableSignature: snapshot.actionableSignature,
     packageName: compact.packageName,
     width: includeScreenshot ? screenshot.width : compact.width,
     height: includeScreenshot ? screenshot.height : compact.height,
@@ -1029,9 +1033,11 @@ function sourceRank(source: SemanticNode["source"]): number {
 
 function createSemanticSnapshot(compact: Record<string, unknown>, nodes: SemanticNode[]): SemanticSnapshot {
   const screenSignature = createScreenSignature(compact, nodes);
+  const actionableSignature = createActionableSignature(compact, nodes);
   return {
     snapshotId: createSnapshotId(screenSignature),
     screenSignature,
+    actionableSignature,
     packageName: typeof compact.packageName === "string" ? compact.packageName : undefined,
     width: typeof compact.width === "number" ? compact.width : undefined,
     height: typeof compact.height === "number" ? compact.height : undefined,
@@ -1083,6 +1089,48 @@ function createScreenSignature(compact: Record<string, unknown>, nodes: Semantic
       }))
   });
   return createHash("sha256").update(signature).digest("hex").slice(0, 16);
+}
+
+function createActionableSignature(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
+  const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
+  const width = typeof compact.width === "number" ? compact.width : "";
+  const height = typeof compact.height === "number" ? compact.height : "";
+  const signature = JSON.stringify({
+    packageName,
+    width,
+    height,
+    nodes: nodes
+      .filter(isActionableForStability)
+      .map((node) => ({
+        role: node.role,
+        text: node.text,
+        contentDesc: node.contentDesc,
+        resourceId: node.resourceId,
+        className: node.className,
+        bounds: coarseBounds(node.bounds),
+        clickable: node.clickable === true,
+        scrollable: node.scrollable === true,
+        editable: node.editable === true
+      }))
+  });
+  return createHash("sha256").update(signature).digest("hex").slice(0, 16);
+}
+
+function isActionableForStability(node: SemanticNode): boolean {
+  return (
+    node.source === "accessibility" &&
+    (node.clickable === true ||
+      node.scrollable === true ||
+      node.editable === true ||
+      node.role === "button" ||
+      node.role === "textbox" ||
+      node.role === "switch" ||
+      node.role === "checkbox")
+  );
+}
+
+function coarseBounds(bounds: Bounds, grid = 32): Bounds {
+  return bounds.map((value) => Math.round(value / grid) * grid) as Bounds;
 }
 
 function createSnapshotId(screenSignature: string): string {
@@ -1343,6 +1391,7 @@ async function tapUniqueNode(
   matches: SemanticNode[],
   snapshot: SemanticSnapshot,
   returnSnapshot: boolean,
+  stableOptions: { waitForStable: boolean; stableTimeoutMs: number; stablePollIntervalMs: number },
   matchKind: string
 ): Promise<ToolResult> {
   if (matches.length === 0) {
@@ -1354,13 +1403,13 @@ async function tapUniqueNode(
   const node = matches[0];
   const [x, y] = node.center;
   const tapResult = normalizeBridgeSuccess(await androidBridgeRpc("tap", { x, y }));
-  const afterSnapshot = returnSnapshot ? await currentAccessibilitySnapshot() : undefined;
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
   return {
     ...tapResult,
     status: "matched",
     actionStrategy: "coordinate_tap",
     target: nodeRefSummary(snapshot.snapshotId, node),
-    ...(afterSnapshot ? { currentSnapshot: afterSnapshot } : {})
+    ...snapshotContext
   };
 }
 
@@ -1418,6 +1467,65 @@ function waitOptions(input: Record<string, unknown>): { timeoutMs: number; pollI
     timeoutMs: Math.max(1, timeoutMs),
     pollIntervalMs: Math.max(50, pollIntervalMs)
   };
+}
+
+function stableSnapshotOptions(input: Record<string, unknown>): { waitForStable: boolean; stableTimeoutMs: number; stablePollIntervalMs: number } {
+  return {
+    waitForStable: optionalBooleanParam(input, "waitForStable", true),
+    stableTimeoutMs: Math.max(1, optionalIntegerParam(input, "stableTimeoutMs", DEFAULT_STABLE_TIMEOUT_MS)),
+    stablePollIntervalMs: Math.max(50, optionalIntegerParam(input, "stablePollIntervalMs", DEFAULT_STABLE_POLL_INTERVAL_MS))
+  };
+}
+
+async function postActionSnapshot(input: {
+  returnSnapshot: boolean;
+  waitForStable: boolean;
+  stableTimeoutMs: number;
+  stablePollIntervalMs: number;
+}): Promise<Record<string, unknown>> {
+  if (!input.returnSnapshot) {
+    return {};
+  }
+  if (!input.waitForStable) {
+    return {
+      currentSnapshot: await currentAccessibilitySnapshot(),
+      snapshotStable: false,
+      stability: "not_requested",
+      snapshotWaitElapsedMs: 0
+    };
+  }
+  const stable = await waitForStableSnapshot({
+    timeoutMs: input.stableTimeoutMs,
+    pollIntervalMs: input.stablePollIntervalMs
+  });
+  return {
+    currentSnapshot: stable.snapshot,
+    snapshotStable: stable.stability !== "timeout",
+    stability: stable.stability,
+    snapshotWaitElapsedMs: stable.elapsedMs
+  };
+}
+
+async function waitForStableSnapshot(options: {
+  timeoutMs: number;
+  pollIntervalMs: number;
+}): Promise<{ snapshot: SemanticSnapshot; stability: "strict" | "actionable" | "timeout"; elapsedMs: number }> {
+  const start = performance.now();
+  let previous = await currentAccessibilitySnapshot();
+  await sleep(options.pollIntervalMs);
+  while (performance.now() - start <= options.timeoutMs) {
+    const current = await currentAccessibilitySnapshot();
+    const elapsedMs = Math.round(performance.now() - start);
+    if (current.screenSignature === previous.screenSignature) {
+      return { snapshot: current, stability: "strict", elapsedMs };
+    }
+    if (current.actionableSignature === previous.actionableSignature) {
+      return { snapshot: current, stability: "actionable", elapsedMs };
+    }
+    previous = current;
+    await sleep(options.pollIntervalMs);
+  }
+  return { snapshot: previous, stability: "timeout", elapsedMs: Math.round(performance.now() - start) };
 }
 
 async function pollUntil<T>(
@@ -1522,6 +1630,7 @@ async function androidTapRef(input: unknown): Promise<ToolResult> {
   const snapshotId = stringParam(params, "snapshotId");
   const ref = stringParam(params, "ref");
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const resolved = await resolveAccessibilityRef(snapshotId, ref);
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
@@ -1529,14 +1638,14 @@ async function androidTapRef(input: unknown): Promise<ToolResult> {
 
   const [x, y] = resolved.targetNode.center;
   const tapResult = normalizeBridgeSuccess(await androidBridgeRpc("tap", { x, y }));
-  const afterSnapshot = returnSnapshot ? await currentAccessibilitySnapshot() : undefined;
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
   return {
     ...tapResult,
     status: resolved.status,
     actionStrategy: "coordinate_tap",
     from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
     target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
-    ...(afterSnapshot ? { currentSnapshot: afterSnapshot } : {})
+    ...snapshotContext
   };
 }
 
@@ -1547,6 +1656,7 @@ async function androidFillRef(input: unknown): Promise<ToolResult> {
   const text = stringParam(params, "text");
   const pressEnter = optionalBooleanParam(params, "pressEnter", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const resolved = await resolveAccessibilityRef(snapshotId, ref);
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
@@ -1563,14 +1673,14 @@ async function androidFillRef(input: unknown): Promise<ToolResult> {
   }
 
   const result = await inputTextIntoNode(resolved.targetNode, text, pressEnter);
-  const afterSnapshot = returnSnapshot ? await currentAccessibilitySnapshot() : undefined;
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
   return {
     ...result,
     status: resolved.status,
     actionStrategy: "accessibility_set_text",
     from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
     target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
-    ...(afterSnapshot ? { currentSnapshot: afterSnapshot } : {})
+    ...snapshotContext
   };
 }
 
@@ -1580,8 +1690,9 @@ async function androidTapText(input: unknown): Promise<ToolResult> {
   const role = optionalStringParam(params, "role");
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const snapshot = await currentAccessibilitySnapshot();
-  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { text, role, fuzzy }), snapshot, returnSnapshot, "text");
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { text, role, fuzzy }), snapshot, returnSnapshot, stableOptions, "text");
 }
 
 async function androidTapContentDesc(input: unknown): Promise<ToolResult> {
@@ -1590,16 +1701,18 @@ async function androidTapContentDesc(input: unknown): Promise<ToolResult> {
   const role = optionalStringParam(params, "role");
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const snapshot = await currentAccessibilitySnapshot();
-  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { contentDesc, role, fuzzy }), snapshot, returnSnapshot, "contentDesc");
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { contentDesc, role, fuzzy }), snapshot, returnSnapshot, stableOptions, "contentDesc");
 }
 
 async function androidClick(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const locator = locatorFromParams(params);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const snapshot = await currentAccessibilitySnapshot();
-  return tapUniqueNode(findNodesByLocator(snapshot.nodes, locator), snapshot, returnSnapshot, "locator");
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, locator), snapshot, returnSnapshot, stableOptions, "locator");
 }
 
 async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
@@ -1609,6 +1722,7 @@ async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const pressEnter = optionalBooleanParam(params, "pressEnter", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const snapshot = await currentAccessibilitySnapshot();
   const labels = findLabelNodes(snapshot.nodes, label, fuzzy);
   if (labels.length === 0) {
@@ -1639,14 +1753,14 @@ async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
   }
 
   const result = await inputTextIntoNode(best.node, text, pressEnter);
-  const afterSnapshot = returnSnapshot ? await currentAccessibilitySnapshot() : undefined;
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
   return {
     ...result,
     status: "filled",
     actionStrategy: "accessibility_set_text",
     label: nodeRefSummary(snapshot.snapshotId, labels[0]),
     target: nodeRefSummary(snapshot.snapshotId, best.node),
-    ...(afterSnapshot ? { currentSnapshot: afterSnapshot } : {})
+    ...snapshotContext
   };
 }
 
@@ -2004,6 +2118,12 @@ const selectorSchema = {
   },
   additionalProperties: false
 };
+const stableSnapshotProperties = {
+  returnSnapshot: { type: "boolean", default: true },
+  waitForStable: { type: "boolean", default: true },
+  stableTimeoutMs: { type: "integer", minimum: 1, default: DEFAULT_STABLE_TIMEOUT_MS },
+  stablePollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_STABLE_POLL_INTERVAL_MS }
+};
 
 const tools: ToolDefinition[] = [
   {
@@ -2150,7 +2270,7 @@ const tools: ToolDefinition[] = [
       properties: {
         snapshotId: { type: "string", minLength: 1 },
         ref: { type: "string", minLength: 1 },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },
@@ -2167,7 +2287,7 @@ const tools: ToolDefinition[] = [
         ref: { type: "string", minLength: 1 },
         text: { type: "string", minLength: 1 },
         pressEnter: { type: "boolean", default: false },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },
@@ -2183,7 +2303,7 @@ const tools: ToolDefinition[] = [
         text: { type: "string", minLength: 1 },
         role: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },
@@ -2199,7 +2319,7 @@ const tools: ToolDefinition[] = [
         contentDesc: { type: "string", minLength: 1 },
         role: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },
@@ -2217,7 +2337,7 @@ const tools: ToolDefinition[] = [
         role: { type: "string", minLength: 1 },
         className: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },
@@ -2234,7 +2354,7 @@ const tools: ToolDefinition[] = [
         text: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
         pressEnter: { type: "boolean", default: false },
-        returnSnapshot: { type: "boolean", default: true }
+        ...stableSnapshotProperties
       },
       additionalProperties: false
     },

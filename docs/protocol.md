@@ -41,7 +41,7 @@ ADB-backed MCP tools:
 - `force`: always run OCR and merge OCR nodes with accessibility nodes.
 - `off`: return accessibility nodes only.
 
-`android_get_semantic_screen` returns a `snapshotId`, `screenSignature`, and compact semantic nodes. Each returned node includes a snapshot-local `ref`:
+`android_get_semantic_screen` returns a `snapshotId`, `screenSignature`, `actionableSignature`, and compact semantic nodes. Each returned node includes a snapshot-local `ref`:
 
 - Accessibility refs use `a1`, `a2`, `a3`, etc.
 - OCR refs use `o1`, `o2`, `o3`, etc.
@@ -53,6 +53,15 @@ Semantic nodes may also include:
 - `role`: best-effort role inferred from Android class names, actions, and OCR source.
 - `editable`: whether the node appears to support text editing.
 - `score`: usefulness score for agent selection and default ordering.
+
+High-level action tools that return `currentSnapshot` support stable snapshot waiting:
+
+- `returnSnapshot`: include post-action context, default `true`.
+- `waitForStable`: wait for a stable post-action accessibility snapshot before returning, default `true`.
+- `stableTimeoutMs`: maximum stable wait, default `1500`.
+- `stablePollIntervalMs`: stable wait poll interval, default `150`.
+
+Stable waiting first checks strict `screenSignature` equality across consecutive snapshots. If full signatures keep changing, for example on an animated pager, it falls back to `actionableSignature`, which only considers actionable accessibility nodes with coarse bounds. Responses include `snapshotStable`, `stability` (`strict`, `actionable`, `timeout`, or `not_requested`), and `snapshotWaitElapsedMs`.
 
 `android_tap_ref` taps a cached accessibility node by `snapshotId` and `ref`:
 
