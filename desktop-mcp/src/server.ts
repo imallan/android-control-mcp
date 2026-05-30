@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -23,20 +25,63 @@ type Bounds = [number, number, number, number];
 
 type OcrMode = "auto" | "force" | "off";
 
+type OcrEngine = "tesseract" | "apple-vision";
+
 type SemanticNode = {
   id: string;
+  ref?: string;
   text?: string;
   contentDesc?: string;
   resourceId?: string;
   className?: string;
+  role?: string;
   bounds: Bounds;
   center: [number, number];
   clickable?: boolean;
   scrollable?: boolean;
+  editable?: boolean;
   actions?: string[];
   source: "accessibility" | "ocr";
   confidence?: number;
+  score?: number;
 };
+
+type SemanticSnapshot = {
+  snapshotId: string;
+  screenSignature: string;
+  actionableSignature: string;
+  packageName?: string;
+  width?: number;
+  height?: number;
+  nodes: SemanticNode[];
+  nodeCount: number;
+};
+
+type SnapshotCacheEntry = SemanticSnapshot & {
+  createdAtMs: number;
+};
+
+type ResolvedRef =
+  | {
+      ok: true;
+      status: "fresh" | "relocated";
+      cached: SnapshotCacheEntry;
+      originalNode: SemanticNode;
+      current: SemanticSnapshot;
+      targetNode: SemanticNode;
+    }
+  | {
+      ok: false;
+      status: "expired_snapshot" | "ref_not_found" | "unsupported_ref_source" | "stale_ref_not_found" | "stale_ref_ambiguous";
+      message: string;
+      snapshotId: string;
+      ref: string;
+      cached?: SnapshotCacheEntry;
+      originalNode?: SemanticNode;
+      current?: SemanticSnapshot;
+      candidates?: Record<string, unknown>[];
+      source?: SemanticNode["source"];
+    };
 
 type ScreenshotResult = ToolResult & {
   imagePath: string;
@@ -70,6 +115,15 @@ type NodeSelector = {
   occurrence?: number;
 };
 
+type NodeLocator = {
+  resourceId?: string;
+  text?: string;
+  contentDesc?: string;
+  role?: string;
+  className?: string;
+  fuzzy: boolean;
+};
+
 type ToolDefinition = {
   name: string;
   description: string;
@@ -79,10 +133,21 @@ type ToolDefinition = {
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_ADB_TIMEOUT_MS ?? 15_000);
 const SCREENSHOT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_SCREENSHOT_TIMEOUT_MS ?? 20_000);
-const OCR_TIMEOUT_MS = Number(process.env.ANDROID_MCP_OCR_TIMEOUT_MS ?? 30_000);
+const OCR_TIMEOUT_MS = Number(process.env.ANDROID_MCP_OCR_TIMEOUT_MS ?? 90_000);
 const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
 const BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const APPLE_VISION_OCR_SOURCE = join(MODULE_DIR, "..", "apple-vision-ocr.swift");
+const APPLE_VISION_OCR_BIN = process.env.ANDROID_MCP_APPLE_VISION_OCR_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-ocr");
+const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-cache");
+const SNAPSHOT_CACHE_LIMIT = 20;
+const DEFAULT_WAIT_TIMEOUT_MS = 5_000;
+const DEFAULT_WAIT_POLL_INTERVAL_MS = 300;
+const DEFAULT_STABLE_TIMEOUT_MS = 1_500;
+const DEFAULT_STABLE_POLL_INTERVAL_MS = 150;
+
+const snapshotCache = new Map<string, SnapshotCacheEntry>();
 
 const KEYCODES: Record<string, string> = {
   BACK: "KEYCODE_BACK",
@@ -466,6 +531,7 @@ async function androidOcrScreen(input: unknown): Promise<ToolResult> {
     roi: options.roi,
     langs: options.langs,
     minConfidence: options.minConfidence,
+    ocrEngine: options.ocrEngine,
     nodes: ocr.nodes.slice(0, options.maxNodes),
     nodeCount: Math.min(ocr.nodes.length, options.maxNodes),
     totalNodeCount: ocr.nodes.length,
@@ -487,20 +553,26 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
   const ocr = shouldRunOcr ? await runOcr(screenshot, options) : undefined;
   const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], options.maxNodes);
+  const snapshot = createSemanticSnapshot(compact, nodes);
+  rememberSnapshot(snapshot);
 
   return {
     ...(includeScreenshot ? screenshot : {}),
+    snapshotId: snapshot.snapshotId,
+    screenSignature: snapshot.screenSignature,
+    actionableSignature: snapshot.actionableSignature,
     packageName: compact.packageName,
     width: includeScreenshot ? screenshot.width : compact.width,
     height: includeScreenshot ? screenshot.height : compact.height,
     ocrMode,
     ocrUsed: shouldRunOcr,
+    ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
     ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
     treeUsable: tree.usable,
     accessibilityNodeCount: accessibilityNodes.length,
     ocrNodeCount: ocr?.nodes.length ?? 0,
-    nodes,
-    nodeCount: nodes.length,
+    nodes: snapshot.nodes,
+    nodeCount: snapshot.nodeCount,
     ...(includeRawTree ? { compactTree: compact } : {}),
     ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {})
   };
@@ -509,6 +581,7 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
 function ocrOptions(input: unknown): {
   roi?: Bounds;
   langs: string;
+  ocrEngine: OcrEngine;
   maxNodes: number;
   minConfidence: number;
   retain: boolean;
@@ -516,11 +589,13 @@ function ocrOptions(input: unknown): {
 } {
   const params = optionalObject(input);
   const langs = optionalStringParam(params, "langs") ?? "chi_sim+eng";
+  const ocrEngine = optionalEnumParam(params, "ocrEngine", ["tesseract", "apple-vision"] as const, "apple-vision");
   const maxNodes = Math.max(1, optionalIntegerParam(params, "maxNodes", 80));
   const minConfidence = Math.min(100, optionalIntegerParam(params, "minConfidence", 45));
   return {
     roi: optionalRoiParam(params, "roi"),
     langs,
+    ocrEngine,
     maxNodes,
     minConfidence,
     retain: optionalBooleanParam(params, "retain", false),
@@ -530,30 +605,154 @@ function ocrOptions(input: unknown): {
 
 async function runOcr(
   screenshot: ScreenshotResult,
-  options: { roi?: Bounds; langs: string; minConfidence: number }
+  options: { roi?: Bounds; langs: string; ocrEngine: OcrEngine; minConfidence: number }
 ): Promise<{ nodes: SemanticNode[]; rawOcr: string; elapsedMs: number }> {
   const start = performance.now();
   const target = options.roi ? await cropImage(screenshot, options.roi) : { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
-  const rawOcr = await execText("tesseract", [target.imagePath, "stdout", "-l", options.langs, "--psm", "6", "tsv"], OCR_TIMEOUT_MS);
-  const words = parseTesseractTsv(rawOcr, options.minConfidence, target.offsetX, target.offsetY);
+  const result =
+    options.ocrEngine === "apple-vision"
+      ? await runAppleVisionOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY)
+      : await runTesseractOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY);
   return {
-    nodes: mergeOcrWords(words),
-    rawOcr,
+    nodes: result.nodes,
+    rawOcr: result.rawOcr,
     elapsedMs: Math.round(performance.now() - start)
   };
 }
 
+async function runTesseractOcr(
+  imagePath: string,
+  langs: string,
+  minConfidence: number,
+  offsetX: number,
+  offsetY: number
+): Promise<{ nodes: SemanticNode[]; rawOcr: string }> {
+  const rawOcr = await execText("tesseract", [imagePath, "stdout", "-l", langs, "--psm", "6", "tsv"], OCR_TIMEOUT_MS);
+  const words = parseTesseractTsv(rawOcr, minConfidence, offsetX, offsetY);
+  return { nodes: mergeOcrWords(words), rawOcr };
+}
+
+async function runAppleVisionOcr(
+  imagePath: string,
+  langs: string,
+  minConfidence: number,
+  offsetX: number,
+  offsetY: number
+): Promise<{ nodes: SemanticNode[]; rawOcr: string }> {
+  const bin = await ensureAppleVisionOcrBin();
+  const visionLangs = appleVisionLanguages(langs).join(",");
+  const rawOcr = await execText(bin, [imagePath, "--langs", visionLangs], OCR_TIMEOUT_MS);
+  return { nodes: parseAppleVisionOcr(rawOcr, minConfidence, offsetX, offsetY), rawOcr };
+}
+
+async function ensureAppleVisionOcrBin(): Promise<string> {
+  try {
+    await access(APPLE_VISION_OCR_BIN);
+    return APPLE_VISION_OCR_BIN;
+  } catch {
+    await mkdir(dirname(APPLE_VISION_OCR_BIN), { recursive: true });
+    await mkdir(CLANG_MODULE_CACHE_DIR, { recursive: true });
+    await execText("swiftc", [APPLE_VISION_OCR_SOURCE, "-o", APPLE_VISION_OCR_BIN], OCR_TIMEOUT_MS);
+    return APPLE_VISION_OCR_BIN;
+  }
+}
+
+function appleVisionLanguages(langs: string): string[] {
+  const requested = langs
+    .split(/[+,]/)
+    .map((lang) => lang.trim())
+    .filter(Boolean);
+  const mapped = requested.map((lang) => {
+      switch (lang) {
+        case "chi_sim":
+        case "zh":
+        case "zh_CN":
+        case "zh-CN":
+          return "zh-Hans";
+        case "chi_tra":
+        case "zh_TW":
+        case "zh-TW":
+          return "zh-Hant";
+        case "eng":
+        case "en":
+          return "en-US";
+        default:
+          return lang;
+      }
+    });
+  if (requested.some((lang) => ["chi_sim", "zh", "zh_CN", "zh-CN", "zh-Hans"].includes(lang))) {
+    return ["zh-Hans"];
+  }
+  if (requested.some((lang) => ["chi_tra", "zh_TW", "zh-TW", "zh-Hant"].includes(lang))) {
+    return ["zh-Hant"];
+  }
+  return mapped.length > 0 ? Array.from(new Set(mapped)) : ["zh-Hans", "en-US"];
+}
+
+function parseAppleVisionOcr(rawOcr: string, minConfidence: number, offsetX: number, offsetY: number): SemanticNode[] {
+  const parsed = expectObject(JSON.parse(rawOcr));
+  const rawNodes = parsed.nodes;
+  if (!Array.isArray(rawNodes)) {
+    throw new Error("Apple Vision OCR output did not include nodes.");
+  }
+
+  const nodes: SemanticNode[] = [];
+  for (const [index, rawNode] of rawNodes.entries()) {
+    const node = expectObject(rawNode);
+    const text = optionalStringParam(node, "text");
+    const confidence = numberParam(node, "confidence");
+    const rawBounds = node.bounds;
+    if (!text || confidence < minConfidence || !isUsefulOcrText(text)) {
+      continue;
+    }
+    if (!Array.isArray(rawBounds) || rawBounds.length !== 4 || !rawBounds.every((value) => Number.isInteger(value) && value >= 0)) {
+      continue;
+    }
+    const bounds: Bounds = [
+      (rawBounds[0] as number) + offsetX,
+      (rawBounds[1] as number) + offsetY,
+      (rawBounds[2] as number) + offsetX,
+      (rawBounds[3] as number) + offsetY
+    ];
+    nodes.push({
+      id: `ocr:${index + 1}`,
+      text: truncate(text, 80),
+      bounds,
+      center: boundsCenter(bounds),
+      clickable: true,
+      source: "ocr",
+      confidence
+    });
+  }
+
+  return dedupeSemanticNodes(nodes).sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0]);
+}
+
 async function cropImage(screenshot: ScreenshotResult, roi: Bounds): Promise<{ imagePath: string; offsetX: number; offsetY: number }> {
-  const x1 = Math.min(roi[0], screenshot.width - 1);
-  const y1 = Math.min(roi[1], screenshot.height - 1);
+  if (roi[0] === 0 && roi[1] === 0 && roi[2] >= screenshot.width && roi[3] >= screenshot.height) {
+    return { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
+  }
+
+  let x1 = Math.min(roi[0], screenshot.width - 1);
+  let y1 = Math.min(roi[1], screenshot.height - 1);
   const x2 = Math.min(roi[2], screenshot.width);
   const y2 = Math.min(roi[3], screenshot.height);
-  if (x2 <= x1 || y2 <= y1) {
+  let width = x2 - x1;
+  let height = y2 - y1;
+  if (width <= 0 || height <= 0) {
     throw new ToolInputError("roi falls outside the screenshot bounds.");
   }
 
-  const width = x2 - x1;
-  const height = y2 - y1;
+  // sips may skip cropping when the crop offset lands exactly on the bottom/right edge.
+  // Shift the crop inward by one pixel in that case; the OCR coordinate offset remains
+  // accurate enough for click-center estimation.
+  if (x1 > 0 && x1 + width >= screenshot.width) {
+    x1 = Math.max(0, screenshot.width - width - 1);
+  }
+  if (y1 > 0 && y1 + height >= screenshot.height) {
+    y1 = Math.max(0, screenshot.height - height - 1);
+  }
+
   const dir = screenshot.retained ? await mkdtemp(join(tmpdir(), "android-ui-mcp-ocr-")) : join(tmpdir(), "android-ui-mcp");
   await mkdir(dir, { recursive: true });
   const cropPath = join(dir, "ocr-crop.png");
@@ -567,6 +766,7 @@ async function execText(command: string, args: string[], timeoutMs: number): Pro
     const { stdout } = await execFileAsync(command, args, {
       encoding: "utf8",
       timeout: timeoutMs,
+      env: { ...process.env, CLANG_MODULE_CACHE_PATH: CLANG_MODULE_CACHE_DIR },
       maxBuffer: 32 * 1024 * 1024
     });
     return stdout;
@@ -729,9 +929,7 @@ function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNo
 
 function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: SemanticNode[], maxNodes: number): SemanticNode[] {
   const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes]);
-  return merged
-    .sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0] || sourceRank(a.source) - sourceRank(b.source))
-    .slice(0, maxNodes);
+  return assignSnapshotRefs(rankSemanticNodes(merged).slice(0, maxNodes));
 }
 
 function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
@@ -749,8 +947,626 @@ function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
   return result;
 }
 
+function rankSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
+  return nodes
+    .map((node) => {
+      const role = inferNodeRole(node);
+      const editable = isNodeEditable(node, role);
+      const scoredNode = { ...node, ...(role ? { role } : {}), editable };
+      return { ...scoredNode, score: scoreSemanticNode(scoredNode) };
+    })
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0] || sourceRank(a.source) - sourceRank(b.source));
+}
+
+function assignSnapshotRefs(nodes: SemanticNode[]): SemanticNode[] {
+  let accessibilityIndex = 0;
+  let ocrIndex = 0;
+  return nodes.map((node) => ({
+    ...node,
+    ref: node.source === "accessibility" ? `a${++accessibilityIndex}` : `o${++ocrIndex}`
+  }));
+}
+
+function inferNodeRole(node: SemanticNode): string | undefined {
+  const className = node.className ?? "";
+  if (isNodeEditable(node)) {
+    return "textbox";
+  }
+  if (className.includes("CheckBox")) {
+    return "checkbox";
+  }
+  if (className.includes("Switch")) {
+    return "switch";
+  }
+  if (className.includes("Button") || (node.clickable && Boolean(node.text || node.contentDesc))) {
+    return "button";
+  }
+  if (node.scrollable) {
+    return "scrollable";
+  }
+  if (node.text || node.contentDesc || node.source === "ocr") {
+    return "text";
+  }
+  return undefined;
+}
+
+function isNodeEditable(node: SemanticNode, role?: string): boolean {
+  return role === "textbox" || (node.className ?? "").includes("EditText") || actionNames(node).includes("set_text");
+}
+
+function scoreSemanticNode(node: SemanticNode): number {
+  let score = node.source === "accessibility" ? 0.4 : 0.2;
+  if (node.editable) {
+    score += 0.5;
+  }
+  if (node.clickable) {
+    score += 0.3;
+  }
+  if (node.scrollable) {
+    score += 0.18;
+  }
+  if (node.resourceId) {
+    score += 0.12;
+  }
+  if (node.contentDesc) {
+    score += 0.1;
+  }
+  if (node.text) {
+    score += 0.08;
+  }
+  if (node.role === "button" || node.role === "checkbox" || node.role === "switch") {
+    score += 0.12;
+  }
+  if (node.role === "text" && node.source === "ocr") {
+    score += 0.05;
+  }
+  return Math.min(1, Number(score.toFixed(3)));
+}
+
+function actionNames(node: SemanticNode): string[] {
+  return (node.actions ?? []).map((action) => action.toLowerCase());
+}
+
 function sourceRank(source: SemanticNode["source"]): number {
   return source === "accessibility" ? 0 : 1;
+}
+
+function createSemanticSnapshot(compact: Record<string, unknown>, nodes: SemanticNode[]): SemanticSnapshot {
+  const screenSignature = createScreenSignature(compact, nodes);
+  const actionableSignature = createActionableSignature(compact, nodes);
+  return {
+    snapshotId: createSnapshotId(screenSignature),
+    screenSignature,
+    actionableSignature,
+    packageName: typeof compact.packageName === "string" ? compact.packageName : undefined,
+    width: typeof compact.width === "number" ? compact.width : undefined,
+    height: typeof compact.height === "number" ? compact.height : undefined,
+    nodes,
+    nodeCount: nodes.length
+  };
+}
+
+function rememberSnapshot(snapshot: SemanticSnapshot): void {
+  snapshotCache.set(snapshot.snapshotId, { ...snapshot, createdAtMs: Date.now() });
+  while (snapshotCache.size > SNAPSHOT_CACHE_LIMIT) {
+    const oldestKey = snapshotCache.keys().next().value as string | undefined;
+    if (!oldestKey) {
+      break;
+    }
+    snapshotCache.delete(oldestKey);
+  }
+}
+
+function currentAccessibilitySnapshot(): Promise<SemanticSnapshot> {
+  return androidDumpCompact().then((compact) => {
+    const nodes = mergeSemanticNodes(compactNodes(compact), [], 80);
+    const snapshot = createSemanticSnapshot(compact, nodes);
+    rememberSnapshot(snapshot);
+    return snapshot;
+  });
+}
+
+function createScreenSignature(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
+  const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
+  const width = typeof compact.width === "number" ? compact.width : "";
+  const height = typeof compact.height === "number" ? compact.height : "";
+  const signature = JSON.stringify({
+    packageName,
+    width,
+    height,
+    nodes: nodes
+      .filter((node) => node.source === "accessibility")
+      .map((node) => ({
+        role: node.role,
+        text: node.text,
+        contentDesc: node.contentDesc,
+        resourceId: node.resourceId,
+        className: node.className,
+        bounds: node.bounds,
+        clickable: node.clickable === true,
+        scrollable: node.scrollable === true,
+        editable: node.editable === true
+      }))
+  });
+  return createHash("sha256").update(signature).digest("hex").slice(0, 16);
+}
+
+function createActionableSignature(compact: Record<string, unknown>, nodes: SemanticNode[]): string {
+  const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
+  const width = typeof compact.width === "number" ? compact.width : "";
+  const height = typeof compact.height === "number" ? compact.height : "";
+  const signature = JSON.stringify({
+    packageName,
+    width,
+    height,
+    nodes: nodes
+      .filter(isActionableForStability)
+      .map((node) => ({
+        role: node.role,
+        text: node.text,
+        contentDesc: node.contentDesc,
+        resourceId: node.resourceId,
+        className: node.className,
+        bounds: coarseBounds(node.bounds),
+        clickable: node.clickable === true,
+        scrollable: node.scrollable === true,
+        editable: node.editable === true
+      }))
+  });
+  return createHash("sha256").update(signature).digest("hex").slice(0, 16);
+}
+
+function isActionableForStability(node: SemanticNode): boolean {
+  return (
+    node.source === "accessibility" &&
+    (node.clickable === true ||
+      node.scrollable === true ||
+      node.editable === true ||
+      node.role === "button" ||
+      node.role === "textbox" ||
+      node.role === "switch" ||
+      node.role === "checkbox")
+  );
+}
+
+function coarseBounds(bounds: Bounds, grid = 32): Bounds {
+  return bounds.map((value) => Math.round(value / grid) * grid) as Bounds;
+}
+
+function createSnapshotId(screenSignature: string): string {
+  return `screen:${Date.now()}:${screenSignature.slice(0, 10)}`;
+}
+
+function relocateAccessibilityNode(
+  original: SemanticNode,
+  currentNodes: SemanticNode[]
+): { node?: SemanticNode; status: "stale_ref_not_found" | "stale_ref_ambiguous"; message: string; candidates?: Record<string, unknown>[] } {
+  const candidates = currentNodes.filter((node) => node.source === "accessibility");
+  const strategies: Array<{ name: string; matches: SemanticNode[] }> = [
+    {
+      name: "resourceId_role",
+      matches:
+        original.resourceId && original.role
+          ? candidates.filter((node) => node.resourceId === original.resourceId && node.role === original.role)
+          : []
+    },
+    {
+      name: "contentDesc_role",
+      matches:
+        original.contentDesc && original.role
+          ? candidates.filter((node) => node.contentDesc === original.contentDesc && node.role === original.role)
+          : []
+    },
+    {
+      name: "text_role",
+      matches: original.text && original.role ? candidates.filter((node) => node.text === original.text && node.role === original.role) : []
+    },
+    {
+      name: "label_class_bounds",
+      matches: candidates.filter(
+        (node) =>
+          samePrimaryLabel(original, node) &&
+          Boolean(original.className) &&
+          node.className === original.className &&
+          boundsAreNear(original.bounds, node.bounds)
+      )
+    }
+  ];
+
+  for (const strategy of strategies) {
+    if (strategy.matches.length === 1) {
+      return { node: strategy.matches[0], status: "stale_ref_not_found", message: `Relocated by ${strategy.name}.` };
+    }
+    if (strategy.matches.length > 1) {
+      return {
+        status: "stale_ref_ambiguous",
+        message: `The original ref is stale and ${strategy.matches.length} current accessibility nodes match ${strategy.name}.`,
+        candidates: strategy.matches.slice(0, 10).map((node) => nodeRefSummary(undefined, node))
+      };
+    }
+  }
+
+  return {
+    status: "stale_ref_not_found",
+    message: "The original ref is stale and no current accessibility node matched conservatively."
+  };
+}
+
+function samePrimaryLabel(left: SemanticNode, right: SemanticNode): boolean {
+  const leftLabel = left.text ?? left.contentDesc;
+  const rightLabel = right.text ?? right.contentDesc;
+  return Boolean(leftLabel && rightLabel && leftLabel === rightLabel);
+}
+
+function boundsAreNear(left: Bounds, right: Bounds): boolean {
+  const leftCenter = boundsCenter(left);
+  const rightCenter = boundsCenter(right);
+  const dx = leftCenter[0] - rightCenter[0];
+  const dy = leftCenter[1] - rightCenter[1];
+  const distance = Math.sqrt(dx * dx + dy * dy);
+  const leftWidth = Math.max(1, left[2] - left[0]);
+  const leftHeight = Math.max(1, left[3] - left[1]);
+  return distance <= Math.max(120, Math.max(leftWidth, leftHeight));
+}
+
+function nodeRefSummary(snapshotId: string | undefined, node: SemanticNode): Record<string, unknown> {
+  return {
+    ...(snapshotId ? { snapshotId } : {}),
+    ref: node.ref,
+    id: node.id,
+    text: node.text,
+    contentDesc: node.contentDesc,
+    resourceId: node.resourceId,
+    className: node.className,
+    role: node.role,
+    bounds: node.bounds,
+    center: node.center,
+    source: node.source
+  };
+}
+
+async function resolveAccessibilityRef(snapshotId: string, ref: string): Promise<ResolvedRef> {
+  const cached = snapshotCache.get(snapshotId);
+  if (!cached) {
+    return {
+      ok: false,
+      status: "expired_snapshot",
+      message: "The requested snapshotId is no longer cached. Call android_get_semantic_screen again.",
+      snapshotId,
+      ref
+    };
+  }
+
+  const originalNode = cached.nodes.find((node) => node.ref === ref);
+  if (!originalNode) {
+    return {
+      ok: false,
+      status: "ref_not_found",
+      message: "The requested ref was not found in the cached snapshot.",
+      snapshotId,
+      ref,
+      cached
+    };
+  }
+  if (originalNode.source !== "accessibility") {
+    return {
+      ok: false,
+      status: "unsupported_ref_source",
+      message: "OCR refs are observation-only and cannot be used as ref action targets in v1.",
+      snapshotId,
+      ref,
+      cached,
+      originalNode,
+      source: originalNode.source
+    };
+  }
+
+  const current = await currentAccessibilitySnapshot();
+  if (current.screenSignature === cached.screenSignature) {
+    return { ok: true, status: "fresh", cached, originalNode, current, targetNode: originalNode };
+  }
+
+  const relocated = relocateAccessibilityNode(originalNode, current.nodes);
+  if (!relocated.node) {
+    return {
+      ok: false,
+      status: relocated.status,
+      message: relocated.message,
+      snapshotId,
+      ref,
+      cached,
+      originalNode,
+      current,
+      candidates: relocated.candidates
+    };
+  }
+  return { ok: true, status: "relocated", cached, originalNode, current, targetNode: relocated.node };
+}
+
+function refFailureResult(result: Extract<ResolvedRef, { ok: false }>, returnSnapshot: boolean): ToolResult {
+  return {
+    success: false,
+    status: result.status,
+    message: result.message,
+    snapshotId: result.snapshotId,
+    ref: result.ref,
+    ...(result.source ? { source: result.source } : {}),
+    ...(result.originalNode && result.cached ? { from: nodeRefSummary(result.cached.snapshotId, result.originalNode) } : {}),
+    ...(result.candidates ? { candidates: result.candidates } : {}),
+    ...(returnSnapshot && result.current ? { currentSnapshot: result.current } : {})
+  };
+}
+
+function selectorForNode(node: SemanticNode): NodeSelector {
+  if (node.resourceId) {
+    return { resourceId: node.resourceId };
+  }
+  if (node.text) {
+    return { text: node.text };
+  }
+  if (node.contentDesc) {
+    return { contentDesc: node.contentDesc };
+  }
+  return { className: node.className, bounds: boundsToSelector(node.bounds) };
+}
+
+function boundsToSelector(bounds: Bounds): string {
+  return `[${bounds[0]},${bounds[1]}][${bounds[2]},${bounds[3]}]`;
+}
+
+async function inputTextIntoNode(node: SemanticNode, text: string, pressEnter: boolean): Promise<ToolResult> {
+  const response = await androidBridgeRpc("inputText", {
+    text,
+    ...flattenSelector(selectorForNode(node))
+  });
+  const result = normalizeBridgeSuccess(response);
+  if (pressEnter) {
+    await androidBridgeRpc("key", { key: "ENTER" });
+  }
+  return result;
+}
+
+function locatorFromParams(params: Record<string, unknown>): NodeLocator {
+  const locator = {
+    resourceId: optionalStringParam(params, "resourceId"),
+    text: optionalStringParam(params, "text"),
+    contentDesc: optionalStringParam(params, "contentDesc"),
+    role: optionalStringParam(params, "role"),
+    className: optionalStringParam(params, "className"),
+    fuzzy: optionalBooleanParam(params, "fuzzy", false)
+  };
+  if (!locator.resourceId && !locator.text && !locator.contentDesc && !locator.role && !locator.className) {
+    throw new ToolInputError("Provide at least one locator field: resourceId, text, contentDesc, role, or className.");
+  }
+  return locator;
+}
+
+function findNodesByLocator(nodes: SemanticNode[], locator: NodeLocator): SemanticNode[] {
+  return nodes.filter((node) => {
+    if (node.source !== "accessibility") {
+      return false;
+    }
+    if (locator.resourceId && !matchesLocatorValue(node.resourceId, locator.resourceId, locator.fuzzy)) {
+      return false;
+    }
+    if (locator.text && !matchesLocatorValue(node.text, locator.text, locator.fuzzy)) {
+      return false;
+    }
+    if (locator.contentDesc && !matchesLocatorValue(node.contentDesc, locator.contentDesc, locator.fuzzy)) {
+      return false;
+    }
+    if (locator.role && node.role !== locator.role) {
+      return false;
+    }
+    if (locator.className && node.className !== locator.className) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function findLabelNodes(nodes: SemanticNode[], label: string, fuzzy: boolean): SemanticNode[] {
+  return nodes.filter(
+    (node) =>
+      node.source === "accessibility" &&
+      (matchesLocatorValue(node.text, label, fuzzy) || matchesLocatorValue(node.contentDesc, label, fuzzy))
+  );
+}
+
+function matchesLocatorValue(actual: string | undefined, expected: string, fuzzy: boolean): boolean {
+  if (!actual) {
+    return false;
+  }
+  if (!fuzzy) {
+    return actual === expected;
+  }
+  return normalizeLocatorText(actual).includes(normalizeLocatorText(expected));
+}
+
+function normalizeLocatorText(value: string): string {
+  return value.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+async function tapUniqueNode(
+  matches: SemanticNode[],
+  snapshot: SemanticSnapshot,
+  returnSnapshot: boolean,
+  stableOptions: { waitForStable: boolean; stableTimeoutMs: number; stablePollIntervalMs: number },
+  matchKind: string
+): Promise<ToolResult> {
+  if (matches.length === 0) {
+    return noLocatorMatch(`${matchKind}_not_found`, "No accessibility node matched.", snapshot, returnSnapshot);
+  }
+  if (matches.length > 1) {
+    return ambiguousLocatorMatch(`${matchKind}_ambiguous`, "Multiple accessibility nodes matched.", matches, snapshot, returnSnapshot);
+  }
+  const node = matches[0];
+  const [x, y] = node.center;
+  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc("tap", { x, y }));
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...tapResult,
+    status: "matched",
+    actionStrategy: "coordinate_tap",
+    target: nodeRefSummary(snapshot.snapshotId, node),
+    ...snapshotContext
+  };
+}
+
+function noLocatorMatch(status: string, message: string, snapshot: SemanticSnapshot, returnSnapshot: boolean): ToolResult {
+  return {
+    success: false,
+    status,
+    message,
+    ...(returnSnapshot ? { currentSnapshot: snapshot } : {})
+  };
+}
+
+function ambiguousLocatorMatch(
+  status: string,
+  message: string,
+  matches: SemanticNode[],
+  snapshot: SemanticSnapshot,
+  returnSnapshot: boolean
+): ToolResult {
+  return {
+    success: false,
+    status,
+    message,
+    candidates: matches.slice(0, 10).map((node) => nodeRefSummary(snapshot.snapshotId, node)),
+    ...(returnSnapshot ? { currentSnapshot: snapshot } : {})
+  };
+}
+
+function labelFieldDistance(label: SemanticNode, field: SemanticNode): number {
+  const labelCenter = boundsCenter(label.bounds);
+  const fieldCenter = boundsCenter(field.bounds);
+  const verticalOverlap = Math.min(label.bounds[3], field.bounds[3]) - Math.max(label.bounds[1], field.bounds[1]);
+  const sameRow = verticalOverlap > 0;
+  const toRight = field.bounds[0] >= label.bounds[2] - 8;
+  const below = field.bounds[1] >= label.bounds[3] - 8;
+  if (!sameRow && !below) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const dx = Math.max(0, field.bounds[0] - label.bounds[2]);
+  const dy = Math.max(0, field.bounds[1] - label.bounds[3]);
+  const centerDistance = Math.hypot(fieldCenter[0] - labelCenter[0], fieldCenter[1] - labelCenter[1]);
+  if (sameRow && toRight) {
+    return dx + centerDistance * 0.05;
+  }
+  if (below) {
+    return dy + centerDistance * 0.1 + 80;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+function waitOptions(input: Record<string, unknown>): { timeoutMs: number; pollIntervalMs: number } {
+  const timeoutMs = optionalIntegerParam(input, "timeoutMs", DEFAULT_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = optionalIntegerParam(input, "pollIntervalMs", DEFAULT_WAIT_POLL_INTERVAL_MS);
+  return {
+    timeoutMs: Math.max(1, timeoutMs),
+    pollIntervalMs: Math.max(50, pollIntervalMs)
+  };
+}
+
+function stableSnapshotOptions(input: Record<string, unknown>): { waitForStable: boolean; stableTimeoutMs: number; stablePollIntervalMs: number } {
+  return {
+    waitForStable: optionalBooleanParam(input, "waitForStable", true),
+    stableTimeoutMs: Math.max(1, optionalIntegerParam(input, "stableTimeoutMs", DEFAULT_STABLE_TIMEOUT_MS)),
+    stablePollIntervalMs: Math.max(50, optionalIntegerParam(input, "stablePollIntervalMs", DEFAULT_STABLE_POLL_INTERVAL_MS))
+  };
+}
+
+async function postActionSnapshot(input: {
+  returnSnapshot: boolean;
+  waitForStable: boolean;
+  stableTimeoutMs: number;
+  stablePollIntervalMs: number;
+}): Promise<Record<string, unknown>> {
+  if (!input.returnSnapshot) {
+    return {};
+  }
+  if (!input.waitForStable) {
+    return {
+      currentSnapshot: await currentAccessibilitySnapshot(),
+      snapshotStable: false,
+      stability: "not_requested",
+      snapshotWaitElapsedMs: 0
+    };
+  }
+  const stable = await waitForStableSnapshot({
+    timeoutMs: input.stableTimeoutMs,
+    pollIntervalMs: input.stablePollIntervalMs
+  });
+  return {
+    currentSnapshot: stable.snapshot,
+    snapshotStable: stable.stability !== "timeout",
+    stability: stable.stability,
+    snapshotWaitElapsedMs: stable.elapsedMs
+  };
+}
+
+async function waitForStableSnapshot(options: {
+  timeoutMs: number;
+  pollIntervalMs: number;
+}): Promise<{ snapshot: SemanticSnapshot; stability: "strict" | "actionable" | "timeout"; elapsedMs: number }> {
+  const start = performance.now();
+  let previous = await currentAccessibilitySnapshot();
+  await sleep(options.pollIntervalMs);
+  while (performance.now() - start <= options.timeoutMs) {
+    const current = await currentAccessibilitySnapshot();
+    const elapsedMs = Math.round(performance.now() - start);
+    if (current.screenSignature === previous.screenSignature) {
+      return { snapshot: current, stability: "strict", elapsedMs };
+    }
+    if (current.actionableSignature === previous.actionableSignature) {
+      return { snapshot: current, stability: "actionable", elapsedMs };
+    }
+    previous = current;
+    await sleep(options.pollIntervalMs);
+  }
+  return { snapshot: previous, stability: "timeout", elapsedMs: Math.round(performance.now() - start) };
+}
+
+async function pollUntil<T>(
+  options: { timeoutMs: number; pollIntervalMs: number },
+  check: () => Promise<{ done: boolean; data: T }>
+): Promise<{ done: boolean; elapsedMs: number; data: T }> {
+  const start = performance.now();
+  let last: { done: boolean; data: T } | undefined;
+  while (performance.now() - start <= options.timeoutMs) {
+    last = await check();
+    if (last.done) {
+      return { done: true, elapsedMs: Math.round(performance.now() - start), data: last.data };
+    }
+    await sleep(options.pollIntervalMs);
+  }
+  if (!last) {
+    last = await check();
+  }
+  return { done: last.done, elapsedMs: Math.round(performance.now() - start), data: last.data };
+}
+
+function waitResult(
+  success: boolean,
+  elapsedMs: number,
+  options: { timeoutMs: number; pollIntervalMs: number },
+  data: Record<string, unknown>,
+  successStatus: string,
+  timeoutStatus: string
+): ToolResult {
+  return {
+    success,
+    status: success ? successStatus : timeoutStatus,
+    elapsedMs,
+    timeoutMs: options.timeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    ...data
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseBounds(value: string): Bounds | undefined {
@@ -807,6 +1623,145 @@ async function androidTap(input: unknown): Promise<ToolResult> {
   const y = numberParam(params, "y");
   const response = await androidBridgeRpc("tap", { x, y });
   return normalizeBridgeSuccess(response);
+}
+
+async function androidTapRef(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref);
+  if (!resolved.ok) {
+    return refFailureResult(resolved, returnSnapshot);
+  }
+
+  const [x, y] = resolved.targetNode.center;
+  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc("tap", { x, y }));
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...tapResult,
+    status: resolved.status,
+    actionStrategy: "coordinate_tap",
+    from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
+    target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
+    ...snapshotContext
+  };
+}
+
+async function androidFillRef(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const text = stringParam(params, "text");
+  const pressEnter = optionalBooleanParam(params, "pressEnter", false);
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref);
+  if (!resolved.ok) {
+    return refFailureResult(resolved, returnSnapshot);
+  }
+  if (!isNodeEditable(resolved.targetNode, resolved.targetNode.role)) {
+    return {
+      success: false,
+      status: "ref_not_editable",
+      message: "The resolved accessibility node does not appear to be editable.",
+      from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
+      target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
+      ...(returnSnapshot ? { currentSnapshot: resolved.current } : {})
+    };
+  }
+
+  const result = await inputTextIntoNode(resolved.targetNode, text, pressEnter);
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...result,
+    status: resolved.status,
+    actionStrategy: "accessibility_set_text",
+    from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
+    target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
+    ...snapshotContext
+  };
+}
+
+async function androidTapText(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const text = stringParam(params, "text");
+  const role = optionalStringParam(params, "role");
+  const fuzzy = optionalBooleanParam(params, "fuzzy", false);
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const snapshot = await currentAccessibilitySnapshot();
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { text, role, fuzzy }), snapshot, returnSnapshot, stableOptions, "text");
+}
+
+async function androidTapContentDesc(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const contentDesc = stringParam(params, "contentDesc");
+  const role = optionalStringParam(params, "role");
+  const fuzzy = optionalBooleanParam(params, "fuzzy", false);
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const snapshot = await currentAccessibilitySnapshot();
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, { contentDesc, role, fuzzy }), snapshot, returnSnapshot, stableOptions, "contentDesc");
+}
+
+async function androidClick(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const locator = locatorFromParams(params);
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const snapshot = await currentAccessibilitySnapshot();
+  return tapUniqueNode(findNodesByLocator(snapshot.nodes, locator), snapshot, returnSnapshot, stableOptions, "locator");
+}
+
+async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const label = stringParam(params, "label");
+  const text = stringParam(params, "text");
+  const fuzzy = optionalBooleanParam(params, "fuzzy", false);
+  const pressEnter = optionalBooleanParam(params, "pressEnter", false);
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const snapshot = await currentAccessibilitySnapshot();
+  const labels = findLabelNodes(snapshot.nodes, label, fuzzy);
+  if (labels.length === 0) {
+    return noLocatorMatch("label_not_found", "No accessibility label matched.", snapshot, returnSnapshot);
+  }
+  if (labels.length > 1) {
+    return ambiguousLocatorMatch("label_ambiguous", "Multiple accessibility labels matched.", labels, snapshot, returnSnapshot);
+  }
+
+  const fields = snapshot.nodes.filter((node) => node.source === "accessibility" && isNodeEditable(node, node.role));
+  const ranked = fields
+    .map((node) => ({ node, distance: labelFieldDistance(labels[0], node) }))
+    .filter((item) => Number.isFinite(item.distance))
+    .sort((a, b) => a.distance - b.distance);
+  if (ranked.length === 0) {
+    return noLocatorMatch("editable_not_found", "No editable accessibility node was found near the label.", snapshot, returnSnapshot);
+  }
+  const best = ranked[0];
+  const tied = ranked.filter((item) => Math.abs(item.distance - best.distance) < 24);
+  if (tied.length > 1) {
+    return ambiguousLocatorMatch(
+      "editable_ambiguous",
+      "Multiple editable accessibility nodes were similarly close to the label.",
+      tied.map((item) => item.node),
+      snapshot,
+      returnSnapshot
+    );
+  }
+
+  const result = await inputTextIntoNode(best.node, text, pressEnter);
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...result,
+    status: "filled",
+    actionStrategy: "accessibility_set_text",
+    label: nodeRefSummary(snapshot.snapshotId, labels[0]),
+    target: nodeRefSummary(snapshot.snapshotId, best.node),
+    ...snapshotContext
+  };
 }
 
 async function androidSwipe(input: unknown): Promise<ToolResult> {
@@ -880,6 +1835,72 @@ async function androidKey(input: unknown): Promise<ToolResult> {
   }
   const response = await androidBridgeRpc("key", { key });
   return normalizeBridgeSuccess({ ...response, key, keycode });
+}
+
+async function androidCurrentApp(input: unknown): Promise<ToolResult> {
+  optionalObject(input);
+  const response = await androidBridgeRpc("currentApp");
+  return {
+    ...response,
+    packageName: typeof response.packageName === "string" ? response.packageName : undefined
+  };
+}
+
+async function androidWaitForPackage(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const packageName = stringParam(params, "packageName");
+  const wait = waitOptions(params);
+  const result = await pollUntil(wait, async () => {
+    const current = await androidCurrentApp({});
+    return {
+      done: current.packageName === packageName,
+      data: { currentApp: current }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "package_found", "package_timeout");
+}
+
+async function androidWaitForText(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const text = stringParam(params, "text");
+  const role = optionalStringParam(params, "role");
+  const fuzzy = optionalBooleanParam(params, "fuzzy", false);
+  const wait = waitOptions(params);
+  const result = await pollUntil(wait, async () => {
+    const snapshot = await currentAccessibilitySnapshot();
+    const matches = findNodesByLocator(snapshot.nodes, { text, role, fuzzy });
+    return {
+      done: matches.length > 0,
+      data: {
+        currentSnapshot: snapshot,
+        matches: matches.slice(0, 10).map((node) => nodeRefSummary(snapshot.snapshotId, node))
+      }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "text_found", "text_timeout");
+}
+
+async function androidWaitForScreenChange(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const wait = waitOptions(params);
+  const snapshotId = optionalStringParam(params, "snapshotId");
+  const screenSignature = optionalStringParam(params, "screenSignature");
+  let baseline = screenSignature;
+  if (!baseline && snapshotId) {
+    baseline = snapshotCache.get(snapshotId)?.screenSignature;
+  }
+  if (!baseline) {
+    baseline = (await currentAccessibilitySnapshot()).screenSignature;
+  }
+
+  const result = await pollUntil(wait, async () => {
+    const snapshot = await currentAccessibilitySnapshot();
+    return {
+      done: snapshot.screenSignature !== baseline,
+      data: { baselineScreenSignature: baseline, currentSnapshot: snapshot }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "screen_changed", "screen_change_timeout");
 }
 
 async function androidBridgePing(input: unknown): Promise<ToolResult> {
@@ -1079,6 +2100,7 @@ const roiSchema = {
 const ocrCommonProperties = {
   roi: roiSchema,
   langs: { type: "string", minLength: 1, default: "chi_sim+eng" },
+  ocrEngine: { type: "string", enum: ["tesseract", "apple-vision"], default: "apple-vision" },
   maxNodes: { type: "integer", minimum: 1, default: 80 },
   minConfidence: { type: "integer", minimum: 0, maximum: 100, default: 45 },
   retain: { type: "boolean", default: false },
@@ -1096,6 +2118,12 @@ const selectorSchema = {
   },
   additionalProperties: false
 };
+const stableSnapshotProperties = {
+  returnSnapshot: { type: "boolean", default: true },
+  waitForStable: { type: "boolean", default: true },
+  stableTimeoutMs: { type: "integer", minimum: 1, default: DEFAULT_STABLE_TIMEOUT_MS },
+  stablePollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_STABLE_POLL_INTERVAL_MS }
+};
 
 const tools: ToolDefinition[] = [
   {
@@ -1109,6 +2137,59 @@ const tools: ToolDefinition[] = [
     description: "Ask the persistent on-device UIAutomator bridge to stop serving requests.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: androidBridgeExit
+  },
+  {
+    name: "android_current_app",
+    description: "Return the current foreground Android package reported by the on-device bridge.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidCurrentApp
+  },
+  {
+    name: "android_wait_for_package",
+    description: "Poll the foreground package until it matches the requested package name or times out.",
+    inputSchema: {
+      type: "object",
+      required: ["packageName"],
+      properties: {
+        packageName: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForPackage
+  },
+  {
+    name: "android_wait_for_text",
+    description: "Poll the current accessibility snapshot until at least one node matches text.",
+    inputSchema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        text: { type: "string", minLength: 1 },
+        role: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForText
+  },
+  {
+    name: "android_wait_for_screen_change",
+    description: "Poll accessibility snapshots until the screen signature differs from a baseline snapshot or signature.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        screenSignature: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForScreenChange
   },
   {
     name: "android_screenshot",
@@ -1128,7 +2209,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_ocr_screen",
-    description: "Run local Tesseract OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
+    description: "Run local OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
     inputSchema: {
       type: "object",
       properties: ocrCommonProperties,
@@ -1179,6 +2260,105 @@ const tools: ToolDefinition[] = [
       additionalProperties: false
     },
     handler: androidTap
+  },
+  {
+    name: "android_tap_ref",
+    description: "Tap an accessibility node by snapshot-local ref, with stale-screen detection and conservative relocation. OCR refs are observation-only and rejected.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref"],
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidTapRef
+  },
+  {
+    name: "android_fill_ref",
+    description: "Fill an editable accessibility node by snapshot-local ref, with stale-screen detection and conservative relocation. OCR refs are rejected.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref", "text"],
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        text: { type: "string", minLength: 1 },
+        pressEnter: { type: "boolean", default: false },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidFillRef
+  },
+  {
+    name: "android_tap_text",
+    description: "Tap the unique current accessibility node matching text. OCR nodes are not action targets.",
+    inputSchema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        text: { type: "string", minLength: 1 },
+        role: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidTapText
+  },
+  {
+    name: "android_tap_content_desc",
+    description: "Tap the unique current accessibility node matching content description. OCR nodes are not action targets.",
+    inputSchema: {
+      type: "object",
+      required: ["contentDesc"],
+      properties: {
+        contentDesc: { type: "string", minLength: 1 },
+        role: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidTapContentDesc
+  },
+  {
+    name: "android_click",
+    description: "Tap the unique current accessibility node matching a small locator object. OCR nodes are not action targets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resourceId: { type: "string", minLength: 1 },
+        text: { type: "string", minLength: 1 },
+        contentDesc: { type: "string", minLength: 1 },
+        role: { type: "string", minLength: 1 },
+        className: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidClick
+  },
+  {
+    name: "android_fill_near_label",
+    description: "Fill the unique editable accessibility node spatially associated with a visible accessibility label.",
+    inputSchema: {
+      type: "object",
+      required: ["label", "text"],
+      properties: {
+        label: { type: "string", minLength: 1 },
+        text: { type: "string", minLength: 1 },
+        fuzzy: { type: "boolean", default: false },
+        pressEnter: { type: "boolean", default: false },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidFillNearLabel
   },
   {
     name: "android_swipe",

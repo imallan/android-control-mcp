@@ -57,6 +57,12 @@ In one terminal:
 android-server/scripts/start-uiautomator-server.sh
 ```
 
+To build the jar before starting the bridge:
+
+```sh
+android-server/scripts/start-uiautomator-server.sh --build
+```
+
 This does:
 
 ```sh
@@ -65,6 +71,9 @@ adb forward tcp:27183 localabstract:android-ui-mcp
 adb shell uiautomator runtest /data/local/tmp/android-ui-server.jar \
   -c com.example.androiduiserver.BridgeTest#testServe
 ```
+
+By default the start script does not build. `--build` delegates to
+`android-server/scripts/build-uiautomator-jar.sh` before pushing the jar.
 
 When the test process starts, it acquires a screen wake lock and wakes the device so the
 screen stays on for the lifetime of the bridge process. The lock is released when the

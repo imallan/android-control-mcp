@@ -5,12 +5,22 @@ on-device bridge, exposed over MCP stdio:
 
 - `android_bridge_ping`: verify that the on-device bridge is reachable
 - `android_bridge_exit`: stop the on-device bridge
+- `android_current_app`: return the current foreground Android package
+- `android_wait_for_package`
+- `android_wait_for_text`
+- `android_wait_for_screen_change`
 - `android_screenshot`: overwrites one stable temp file by default; pass `retain=true` to keep a unique screenshot
-- `android_ocr_screen`: run local Tesseract OCR on the current screenshot and return compact OCR nodes
+- `android_ocr_screen`: run local OCR on the current screenshot and return compact OCR nodes
 - `android_get_semantic_screen`: return accessibility nodes with automatic or forced OCR fallback
 - `android_dump_tree`: XML hierarchy from the on-device bridge
 - `android_dump_compact`: compact node list from the on-device bridge
 - `android_tap`
+- `android_tap_ref`: tap an accessibility node from a semantic snapshot by `snapshotId` + `ref`
+- `android_fill_ref`: fill an editable accessibility node from a semantic snapshot by `snapshotId` + `ref`
+- `android_tap_text`
+- `android_tap_content_desc`
+- `android_click`
+- `android_fill_near_label`
 - `android_swipe`
 - `android_input_text`
 - `android_key`
@@ -46,7 +56,8 @@ Optional environment variables:
 - `ANDROID_SERIAL`: target device serial
 - `ANDROID_MCP_ADB_TIMEOUT_MS`: default ADB command timeout, default `15000`
 - `ANDROID_MCP_SCREENSHOT_TIMEOUT_MS`: screenshot timeout, default `20000`
-- `ANDROID_MCP_OCR_TIMEOUT_MS`: local OCR command timeout, default `30000`
+- `ANDROID_MCP_OCR_TIMEOUT_MS`: local OCR command timeout, default `90000`
+- `ANDROID_MCP_APPLE_VISION_OCR_BIN`: optional prebuilt Apple Vision OCR helper path
 - `ANDROID_UI_MCP_HOST`: bridge host, default `127.0.0.1`
 - `ANDROID_UI_MCP_PORT`: bridge/adb-forward port, default `27183`
 - `ANDROID_UI_MCP_TIMEOUT_MS`: bridge request timeout, default `15000`
@@ -93,10 +104,14 @@ Restart or reload Codex after installation so it discovers the tools.
 
 ## Transport Notes
 
-- `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
+- `android_current_app`, `android_wait_for_package`, `android_wait_for_text`, `android_wait_for_screen_change`, `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
 - `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
+- High-level ref and locator action tools default to returning a post-action snapshot after waiting up to 1500 ms for strict or actionable accessibility stability.
 - `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
-- `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` require local `tesseract` on `PATH`.
+- `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
+- The Apple Vision engine is the default OCR backend on this MCP.
+- The Tesseract engine requires local `tesseract` on `PATH`.
+- The Apple Vision engine requires macOS. The desktop server compiles `apple-vision-ocr.swift` with `swiftc` into `/tmp/android-ui-mcp/apple-vision-ocr` on first use unless `ANDROID_MCP_APPLE_VISION_OCR_BIN` is set.
 - The MCP server refreshes `adb forward tcp:$ANDROID_UI_MCP_PORT localabstract:android-ui-mcp` before each bridge call.
 
 ## Limitations
@@ -106,3 +121,4 @@ Restart or reload Codex after installation so it discovers the tools.
 - App-name launch uses package/activity-derived aliases. `applicationId` launch is deterministic.
 - `FLAG_SECURE` apps can return black screenshots.
 - WebView, OpenGL, and game screens may expose little or no accessibility tree.
+- Apple Vision is macOS-only and its supported OCR languages depend on the installed system.
