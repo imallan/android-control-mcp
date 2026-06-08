@@ -68,6 +68,8 @@ Recommended tools:
 - `android_fill_ref`
 - `android_perform_action_ref`
 
+Current status: these ref tools are implemented for accessibility refs. `android_perform_action_ref` accepts predefined action names and custom action labels exposed by the target node. OCR refs remain observation-only.
+
 Example:
 
 ```json

@@ -18,6 +18,8 @@ Bridge-backed MCP tools:
 - `android_tap`
 - `android_tap_ref`
 - `android_fill_ref`
+- `android_long_press_ref`
+- `android_perform_action_ref`
 - `android_tap_text`
 - `android_tap_content_desc`
 - `android_click`
@@ -85,7 +87,13 @@ Behavior:
 
 Relocation only considers accessibility nodes. OCR nodes can help the agent understand a sparse screen, but they are not action targets for `android_tap_ref` in v1.
 
-`android_fill_ref` uses the same `snapshotId` + `ref` stale handling as `android_tap_ref`, but only fills nodes that resolve to `editable: true` or `role: "textbox"`. It sends accessibility `inputText` with a selector derived from the resolved node and rejects OCR refs.
+`android_fill_ref`, `android_long_press_ref`, and `android_perform_action_ref` use the same `snapshotId` + `ref` stale handling as `android_tap_ref` and reject OCR refs.
+
+`android_fill_ref` only fills nodes that resolve to `editable: true` or `role: "textbox"`. It sends accessibility `inputText` with a selector derived from the resolved node.
+
+`android_long_press_ref` long-presses the resolved node center through the Android bridge.
+
+`android_perform_action_ref` sends an accessibility action with a selector derived from the resolved node. The action may be one of the common predefined names, such as `click`, `long_click`, `scroll_forward`, `scroll_backward`, `expand`, `collapse`, `dismiss`, `set_selection`, or `set_text`, or a custom action label exposed by that accessibility node in `actions`.
 
 Convenience actions operate on the current accessibility snapshot and do not use OCR nodes as action targets:
 

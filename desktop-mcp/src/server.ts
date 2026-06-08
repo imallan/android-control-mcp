@@ -1326,6 +1326,15 @@ async function inputTextIntoNode(node: SemanticNode, text: string, pressEnter: b
   return result;
 }
 
+async function performActionOnNode(node: SemanticNode, action: string, text?: string): Promise<ToolResult> {
+  const response = await androidBridgeRpc("performAction", {
+    action,
+    ...(text !== undefined ? { text } : {}),
+    ...flattenSelector(selectorForNode(node))
+  });
+  return normalizeBridgeSuccess(response);
+}
+
 function locatorFromParams(params: Record<string, unknown>): NodeLocator {
   const locator = {
     resourceId: optionalStringParam(params, "resourceId"),
@@ -1684,6 +1693,57 @@ async function androidFillRef(input: unknown): Promise<ToolResult> {
   };
 }
 
+async function androidLongPressRef(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref);
+  if (!resolved.ok) {
+    return refFailureResult(resolved, returnSnapshot);
+  }
+
+  const [x, y] = resolved.targetNode.center;
+  const steps = Math.max(1, Math.round(durationMs / 5));
+  const longPressResult = normalizeBridgeSuccess(await androidBridgeRpc("longPress", { x, y, steps }));
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...longPressResult,
+    status: resolved.status,
+    actionStrategy: "coordinate_long_press",
+    from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
+    target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
+    ...snapshotContext
+  };
+}
+
+async function androidPerformActionRef(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const action = stringParam(params, "action");
+  const text = optionalStringParam(params, "text");
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref);
+  if (!resolved.ok) {
+    return refFailureResult(resolved, returnSnapshot);
+  }
+
+  const actionResult = await performActionOnNode(resolved.targetNode, action, text);
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...actionResult,
+    status: resolved.status,
+    actionStrategy: "accessibility_action",
+    from: nodeRefSummary(resolved.cached.snapshotId, resolved.originalNode),
+    target: nodeRefSummary(resolved.status === "fresh" ? resolved.cached.snapshotId : resolved.current.snapshotId, resolved.targetNode),
+    ...snapshotContext
+  };
+}
+
 async function androidTapText(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const text = stringParam(params, "text");
@@ -1805,12 +1865,14 @@ async function androidInputText(input: unknown): Promise<ToolResult> {
 async function androidPerformAction(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const action = stringParam(params, "action");
+  const text = optionalStringParam(params, "text");
   const selector = optionalSelectorParam(params, "selector");
   if (!selector || !selectorHasAnyField(selector)) {
     throw new ToolInputError("selector is required and must identify a node.");
   }
   const response = await androidBridgeRpc("performAction", {
     action,
+    ...(text !== undefined ? { text } : {}),
     ...flattenSelector(selector)
   });
   return normalizeBridgeSuccess(response);
@@ -2294,6 +2356,39 @@ const tools: ToolDefinition[] = [
     handler: androidFillRef
   },
   {
+    name: "android_long_press_ref",
+    description: "Long press an accessibility node by snapshot-local ref, with stale-screen detection and conservative relocation. OCR refs are rejected.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref"],
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        durationMs: { ...integerSchema, default: 650 },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidLongPressRef
+  },
+  {
+    name: "android_perform_action_ref",
+    description: "Execute an accessibility action on a node by snapshot-local ref, with stale-screen detection and conservative relocation. OCR refs are rejected.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref", "action"],
+      properties: {
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        action: { type: "string", minLength: 1 },
+        text: { type: "string", minLength: 1, description: "Text used by the set_text action." },
+        ...stableSnapshotProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidPerformActionRef
+  },
+  {
     name: "android_tap_text",
     description: "Tap the unique current accessibility node matching text. OCR nodes are not action targets.",
     inputSchema: {
@@ -2400,11 +2495,9 @@ const tools: ToolDefinition[] = [
       type: "object",
       required: ["action", "selector"],
       properties: {
-        action: {
-          type: "string",
-          enum: ["click", "long_click", "scroll_forward", "scroll_backward", "expand", "collapse", "dismiss", "set_selection", "set_text"]
-        },
-        selector: selectorSchema
+        action: { type: "string", minLength: 1 },
+        selector: selectorSchema,
+        text: { type: "string", minLength: 1, description: "Text used by the set_text action." }
       },
       additionalProperties: false
     },

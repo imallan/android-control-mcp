@@ -282,21 +282,25 @@ class BridgeTest : UiAutomatorTestCase() {
       throw IllegalArgumentException("performAction requires a target selector")
     }
 
-    val actionId = actionId(actionName)
-      ?: throw IllegalArgumentException("unknown action: $actionName")
-
+    var performedActionLabel: String? = null
     val success =
       performOnMatchingNode(selector) { node ->
         val customAction = resolveCustomAction(node, actionName)
+        val predefinedActionId = actionId(actionName)
         val performed = if (customAction != null) {
+          performedActionLabel = actionLabel(customAction.id, customAction.label?.toString()) ?: actionName
           node.performAction(customAction.id)
-        } else if (actionId == AccessibilityNodeInfo.ACTION_SET_TEXT) {
+        } else if (predefinedActionId == AccessibilityNodeInfo.ACTION_SET_TEXT) {
           val text = request["text"] ?: ""
           val arguments = Bundle()
           arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
-          node.performAction(actionId, arguments)
+          performedActionLabel = actionLabel(predefinedActionId, actionName) ?: actionName
+          node.performAction(predefinedActionId, arguments)
+        } else if (predefinedActionId != null) {
+          performedActionLabel = actionLabel(predefinedActionId, actionName) ?: actionName
+          node.performAction(predefinedActionId)
         } else {
-          node.performAction(actionId)
+          throw IllegalArgumentException("unknown action for selected node: $actionName")
         }
         if (!performed) {
           throw IllegalStateException("selected node rejected $actionName")
@@ -307,7 +311,7 @@ class BridgeTest : UiAutomatorTestCase() {
     }
 
     device.waitForIdle(500)
-    return linkedMapOf("ok" to true, "success" to true, "action" to actionLabel(actionId, request["action"]))
+    return linkedMapOf("ok" to true, "success" to true, "action" to (performedActionLabel ?: actionName))
   }
 
   @Throws(Exception::class)
