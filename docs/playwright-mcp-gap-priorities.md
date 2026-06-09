@@ -240,7 +240,7 @@ Recommended tools:
 
 These tools make the MCP useful for real-device tasks that browser MCPs cannot cover.
 
-> **Current status:** `android_current_app` is implemented. All other system
+> **Current status:** `android_current_app` and `android_go_home` are implemented. All other system
 > workflow helpers listed above are **not yet implemented**.
 
 ## Priority 9: Test And Fake-Bridge Coverage

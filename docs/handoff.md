@@ -36,6 +36,7 @@ Bridge-backed tools:
 - `android_perform_action`
 - `android_long_press`
 - `android_key`
+- `android_go_home`
 - `android_list_apps`
 - `android_launch_app`
 
@@ -433,7 +434,7 @@ To bypass stability waiting for a tool call:
 - CV/object detection (OpenCV, YOLO, PaddleOCR) is not implemented.
 - Trace tools (`android_trace_start`, `android_trace_stop`, `android_trace_status`) are not implemented.
 - Capability groups are not implemented.
-- System workflow helpers (`android_open_notifications`, `android_open_quick_settings`, `android_close_keyboard`, `android_grant_permission_dialog`, `android_go_home`, `android_open_recents`, `android_switch_recent_app`) are not implemented.
+- System workflow helpers (`android_open_notifications`, `android_open_quick_settings`, `android_close_keyboard`, `android_grant_permission_dialog`, `android_open_recents`, `android_switch_recent_app`) are not implemented.
 - `android_wait_for_ref_gone` is not implemented.
 - `after.waitForText` / `after.waitForPackage` post-action conditions are not implemented.
 - Automated fake-bridge integration tests are not implemented.

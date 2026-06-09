@@ -27,6 +27,7 @@ Bridge-backed MCP tools:
 - `android_swipe`
 - `android_input_text`
 - `android_key`
+- `android_go_home`
 - `android_perform_action`
 - `android_long_press`
 - `android_list_apps`

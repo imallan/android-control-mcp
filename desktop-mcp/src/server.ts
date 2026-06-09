@@ -1899,6 +1899,12 @@ async function androidKey(input: unknown): Promise<ToolResult> {
   return normalizeBridgeSuccess({ ...response, key, keycode });
 }
 
+async function androidGoHome(input: unknown): Promise<ToolResult> {
+  optionalObject(input);
+  const response = await androidBridgeRpc("key", { key: "HOME" });
+  return normalizeBridgeSuccess({ ...response, key: "HOME", keycode: KEYCODES.HOME });
+}
+
 async function androidCurrentApp(input: unknown): Promise<ToolResult> {
   optionalObject(input);
   const response = await androidBridgeRpc("currentApp");
@@ -2528,6 +2534,12 @@ const tools: ToolDefinition[] = [
       additionalProperties: false
     },
     handler: androidKey
+  },
+  {
+    name: "android_go_home",
+    description: "Send the HOME key event through the persistent on-device UIAutomator bridge.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidGoHome
   },
   {
     name: "android_list_apps",
