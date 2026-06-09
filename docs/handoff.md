@@ -429,6 +429,14 @@ To bypass stability waiting for a tool call:
 - The OCR fallback is text-only. It does not detect icon-only buttons or visual grouping.
 - Apple Vision quality is much better for Chinese UI text than Tesseract in early tests, but it requires macOS and system language support.
 - Automated tests are still minimal.
+- OCR cache is not yet implemented; every OCR call re-runs the full pipeline.
+- CV/object detection (OpenCV, YOLO, PaddleOCR) is not implemented.
+- Trace tools (`android_trace_start`, `android_trace_stop`, `android_trace_status`) are not implemented.
+- Capability groups are not implemented.
+- System workflow helpers (`android_open_notifications`, `android_open_quick_settings`, `android_close_keyboard`, `android_grant_permission_dialog`, `android_go_home`, `android_open_recents`, `android_switch_recent_app`) are not implemented.
+- `android_wait_for_ref_gone` is not implemented.
+- `after.waitForText` / `after.waitForPackage` post-action conditions are not implemented.
+- Automated fake-bridge integration tests are not implemented.
 
 ## Recommended Next Work
 
@@ -439,7 +447,7 @@ Highest priority:
 
 Hardening:
 
-- Add `android_devices` and `android_current_app`.
+- Add `android_devices`.
 - Add bridge health diagnostics and clearer startup failure messages.
 - Add structured tests for MCP request handling, input validation, bridge error normalization, and selector behavior.
 - Update compatibility notes as more devices and Android versions are tested.

@@ -155,6 +155,11 @@ Why this matters:
 
 Failure responses should be designed for the next agent step, not just for logging.
 
+> **Current status:** `android_wait_for_text`, `android_wait_for_package`,
+> `android_wait_for_screen_change`, and `android_current_app` are implemented.
+> `android_wait_for_ref_gone` and `after.waitForText` / `after.waitForPackage`
+> post-action conditions are **not yet implemented**.
+
 ## Priority 5: Action Result Should Return Fresh Context
 
 Most mutating tools should return enough updated state for the agent to continue without immediately making another observation call.
@@ -199,6 +204,8 @@ Suggested path:
 /tmp/android-ui-mcp/traces/<trace-id>/
 ```
 
+> **Current status:** Not yet implemented.
+
 ## Priority 7: Capability Groups
 
 Split MCP tools into capability groups so clients do not always load every schema.
@@ -213,6 +220,8 @@ Suggested groups:
 - `vision`: raw coordinate tap, raw coordinate long press, raw coordinate mouse-like tools
 
 This mirrors Playwright MCP's capability approach and helps reduce tool confusion and token cost.
+
+> **Current status:** Not yet implemented.
 
 ## Priority 8: Android System Workflow Helpers
 
@@ -231,6 +240,9 @@ Recommended tools:
 
 These tools make the MCP useful for real-device tasks that browser MCPs cannot cover.
 
+> **Current status:** `android_current_app` is implemented. All other system
+> workflow helpers listed above are **not yet implemented**.
+
 ## Priority 9: Test And Fake-Bridge Coverage
 
 Add tests around the agent-facing contract before expanding the tool surface too far.
@@ -247,6 +259,9 @@ Highest-value tests:
 - Real-device smoke tests for launch, snapshot, tap ref, fill ref, wait for text, and screenshot.
 
 The goal is not a full UI test framework. The goal is confidence that the MCP gives agents reliable observations, actions, and recovery data.
+
+> **Current status:** Automated tests and fake-bridge integration tests are
+> not yet implemented.
 
 ## Lower Priority Or Out Of Scope For Now
 
@@ -270,3 +285,6 @@ Defer these unless a concrete user need appears:
 6. Make mutating tools optionally return a fresh compact snapshot.
 7. Add local trace capture.
 8. Split tools into capability groups.
+
+> **Status:** Items 1–6 are implemented. Items 7 (trace capture) and 8
+> (capability groups) are not yet implemented.

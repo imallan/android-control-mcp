@@ -1,5 +1,11 @@
 # Android UI MCP Bridge — Implementation Plan
 
+> **Current status (2026-06-09):** Phase 1–3 are complete. Phase 4 text OCR
+> fallback v1 (Tesseract + Apple Vision) is implemented; OCR cache and
+> CV/object detection (OpenCV, YOLO, PaddleOCR) are **not** implemented.
+> Actual tool names and startup differ from the early Phase 2/3
+> recommendations below — see inline notes.
+
 ## Goal
 
 Build an Android automation bridge that allows an LLM (through MCP) to:
@@ -221,6 +227,10 @@ Push server jar:
 adb push android-ui-server.jar /data/local/tmp/
 ```
 
+> **Actual implementation:** The server is started with
+> `uiautomator runtest /data/local/tmp/android-ui-server.jar -c com.example.androiduiserver.BridgeTest#testServe`,
+> not `app_process / com.example.androiduiserver.Main` as originally sketched below.
+
 Start process:
 
 ```sh
@@ -410,6 +420,11 @@ Benefits:
 
 ## Recommended MCP Tool Design
 
+> **Actual tool names** used in the implementation differ from the early
+> recommendations below: `android_get_screen` → `android_screenshot`,
+> `android_get_tree` → `android_dump_tree` / `android_dump_compact` /
+> `android_get_semantic_screen`.
+
 ### android_get_screen
 
 Returns:
@@ -478,6 +493,12 @@ Input:
 ---
 
 ## Phase 4 — Advanced Features
+
+> **Status:** Text OCR fallback v1 (Tesseract TSV + Apple Vision via
+> `android_ocr_screen` and `android_get_semantic_screen` with `ocrMode`) is
+> implemented. The following are **not yet implemented:** OCR cache,
+> CV/object detection (OpenCV, YOLO, PaddleOCR), Android-side screenshot
+> capture in the bridge, and `FLAG_SECURE` detection.
 
 ### OCR Integration
 
@@ -617,6 +638,9 @@ android-ui-mcp/
 ## Recommended Initial Milestone
 
 ### Week 1
+
+> **Note:** The original week milestones pre-date implementation. Phase 1–3
+> are complete; Phase 4 text OCR is partially implemented.
 
 Deliver:
 

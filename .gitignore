@@ -4,5 +4,6 @@ dist/
 build/
 android-server/build/
 .DS_Store
+.claude/
 *.log
 *.tmp
