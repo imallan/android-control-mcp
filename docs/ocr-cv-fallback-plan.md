@@ -22,7 +22,7 @@ Example response:
 
 ```json
 {
-  "imagePath": "/tmp/android-ui-mcp/current-screen.png",
+  "imagePath": "/tmp/android-ui-mcp/<deviceId>/current-screen.png",
   "width": 1440,
   "height": 3120,
   "treeUsable": false,

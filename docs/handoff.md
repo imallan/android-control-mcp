@@ -68,7 +68,7 @@ android-server/src/com/example/androiduiserver/BridgeTest.kt
 Important behavior:
 
 - MCP transport is stdio with direct JSON-RPC handling.
-- The desktop server refreshes `adb forward` before bridge calls.
+- The desktop server allocates a host forward port per selected device and starts the Android bridge on demand.
 - Screenshots use `adb exec-out screencap -p`.
 - OCR supports local Tesseract TSV output and Apple Vision through `desktop-mcp/apple-vision-ocr.swift`.
 - Apple Vision is the default OCR backend and is macOS-only. Tesseract remains available with `ocrEngine: "tesseract"`.
@@ -77,14 +77,14 @@ Important behavior:
 - Text input prefers accessibility `ACTION_SET_TEXT` through the bridge.
 - App listing uses launcher activities from Android package manager output.
 - App launching uses `monkey -p <applicationId> -c android.intent.category.LAUNCHER 1` from inside the bridge process.
-- `ANDROID_SERIAL` selects a target device when multiple devices are connected.
+- Device-backed tools accept optional `deviceId`; `ANDROID_SERIAL` is only the default when `deviceId` is omitted.
 
 Screenshot file policy:
 
 - Default screenshots overwrite:
 
 ```text
-/tmp/android-ui-mcp/current-screen.png
+/tmp/android-ui-mcp/<deviceId>/current-screen.png
 ```
 
 - `retain: true` creates a unique temp directory and preserves that screenshot.
@@ -422,7 +422,7 @@ To bypass stability waiting for a tool call:
 ## Known Limitations
 
 - `android_screenshot` still uses direct ADB because screenshot capture is not implemented in the Android bridge.
-- Multi-device selection is process-level through `ANDROID_SERIAL`; tools do not accept a per-call serial.
+- Multi-device selection is per call through optional `deviceId`; `ANDROID_SERIAL` remains a default when `deviceId` is omitted.
 - App-name matching is best effort. `applicationId` launch is deterministic.
 - `uiautomator` exposes the accessibility tree, not the full rendered view tree.
 - WebView, OpenGL, game, video, and some Compose screens may expose little or no useful accessibility data.

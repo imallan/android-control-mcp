@@ -6,6 +6,7 @@ The desktop MCP server exposes standard MCP `tools/list` and `tools/call` over s
 
 Bridge-backed MCP tools:
 
+- `android_list_devices`
 - `android_bridge_ping`
 - `android_bridge_exit`
 - `android_current_app`
@@ -37,6 +38,12 @@ ADB-backed MCP tools:
 
 - `android_screenshot`
 - `android_ocr_screen`
+
+Device-backed tools accept optional `deviceId`, using the ADB serial. If omitted,
+the server uses `ANDROID_SERIAL` when set, otherwise auto-selects only when exactly
+one authorized device is connected. With no authorized devices it returns
+`no_device`; with multiple authorized devices it returns `ambiguous_device`.
+The desktop MCP server starts one UIAutomator bridge per selected device on demand.
 
 `android_get_semantic_screen` combines ADB screenshot capture with bridge-backed compact tree access. Its `ocrMode` parameter controls OCR fallback:
 
