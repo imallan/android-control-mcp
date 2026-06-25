@@ -1630,8 +1630,15 @@ async function androidTap(input: unknown): Promise<ToolResult> {
   const params = expectObject(input);
   const x = numberParam(params, "x");
   const y = numberParam(params, "y");
+  const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
+  const stableOptions = stableSnapshotOptions(params);
   const response = await androidBridgeRpc("tap", { x, y });
-  return normalizeBridgeSuccess(response);
+  const tapResult = normalizeBridgeSuccess(response);
+  const snapshotContext = await postActionSnapshot({ returnSnapshot, ...stableOptions });
+  return {
+    ...tapResult,
+    ...snapshotContext
+  };
 }
 
 async function androidTapRef(input: unknown): Promise<ToolResult> {
@@ -2324,7 +2331,7 @@ const tools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       required: ["x", "y"],
-      properties: { x: integerSchema, y: integerSchema },
+      properties: { x: integerSchema, y: integerSchema, ...stableSnapshotProperties },
       additionalProperties: false
     },
     handler: androidTap

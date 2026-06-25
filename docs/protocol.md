@@ -57,7 +57,7 @@ Semantic nodes may also include:
 - `editable`: whether the node appears to support text editing.
 - `score`: usefulness score for agent selection and default ordering.
 
-High-level action tools that return `currentSnapshot` support stable snapshot waiting:
+Action tools that return `currentSnapshot`, including coordinate, ref, and locator taps, support stable snapshot waiting:
 
 - `returnSnapshot`: include post-action context, default `true`.
 - `waitForStable`: wait for a stable post-action accessibility snapshot before returning, default `true`.
