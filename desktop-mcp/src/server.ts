@@ -153,6 +153,8 @@ type BridgeContext = {
   process?: ChildProcessWithoutNullStreams;
   startPromise?: Promise<void>;
   lastError?: string;
+  stdoutTail?: string;
+  stderrTail?: string;
   queue: Promise<unknown>;
 };
 
@@ -163,6 +165,8 @@ const BRIDGE_HOST = process.env.ANDROID_UI_MCP_HOST ?? "127.0.0.1";
 const LEGACY_BRIDGE_PORT = Number(process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_PORT_BASE = Number(process.env.ANDROID_UI_MCP_PORT_BASE ?? process.env.ANDROID_UI_MCP_PORT ?? 27_183);
 const BRIDGE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_TIMEOUT_MS ?? 15_000);
+const BRIDGE_STARTUP_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_STARTUP_TIMEOUT_MS ?? Math.max(30_000, BRIDGE_TIMEOUT_MS));
+const BRIDGE_STARTUP_PROBE_TIMEOUT_MS = Number(process.env.ANDROID_UI_MCP_STARTUP_PROBE_TIMEOUT_MS ?? Math.min(1_000, BRIDGE_TIMEOUT_MS));
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = join(MODULE_DIR, "..", "..");
 const ANDROID_SERVER_JAR = process.env.ANDROID_UI_MCP_JAR ?? join(REPO_DIR, "android-server", "build", "android-ui-server.jar");
@@ -333,6 +337,24 @@ class DeviceManager {
     };
   }
 
+  runningBridge(deviceId: string): BridgeContext | undefined {
+    const bridge = this.bridges.get(deviceId);
+    if (bridge?.state === "running" && bridge.process && bridge.process.exitCode === null) {
+      return bridge;
+    }
+    return undefined;
+  }
+
+  stopBridge(deviceId: string): void {
+    const bridge = this.bridges.get(deviceId);
+    if (!bridge) {
+      return;
+    }
+    bridge.process?.kill();
+    bridge.process = undefined;
+    bridge.state = "stopped";
+  }
+
   stopAll(): void {
     for (const bridge of this.bridges.values()) {
       bridge.process?.kill();
@@ -386,6 +408,8 @@ class DeviceManager {
       await adbTextForDevice(bridge.deviceId, ["push", ANDROID_SERVER_JAR, "/data/local/tmp/android-ui-server.jar"]);
       await adbTextForDevice(bridge.deviceId, ["forward", `tcp:${bridge.port}`, "localabstract:android-ui-mcp"]);
       bridge.process?.kill();
+      bridge.stdoutTail = "";
+      bridge.stderrTail = "";
       bridge.process = spawn("adb", [
         "-s",
         bridge.deviceId,
@@ -396,10 +420,14 @@ class DeviceManager {
         "-c",
         "com.example.androiduiserver.BridgeTest#testServe"
       ]);
-      bridge.process.stdout.resume();
+      bridge.process.stdout.setEncoding("utf8");
+      bridge.process.stdout.on("data", (chunk) => {
+        bridge.stdoutTail = appendOutputTail(bridge.stdoutTail, String(chunk));
+      });
       bridge.process.stderr.setEncoding("utf8");
       bridge.process.stderr.on("data", (chunk) => {
-        bridge.lastError = truncate(String(chunk));
+        bridge.stderrTail = appendOutputTail(bridge.stderrTail, String(chunk));
+        bridge.lastError = bridgeProcessMessage(bridge, "Bridge stderr.");
       });
       bridge.process.on("error", (error) => {
         bridge.state = "failed";
@@ -408,19 +436,73 @@ class DeviceManager {
       bridge.process.on("exit", (code, signal) => {
         bridge.state = code === 0 ? "stopped" : "failed";
         if (code !== 0 || signal) {
-          bridge.lastError = `Bridge process exited with code ${code ?? "null"} signal ${signal ?? "null"}.`;
+          bridge.lastError = bridgeProcessMessage(bridge, `Bridge process exited with code ${code ?? "null"} signal ${signal ?? "null"}.`);
         }
       });
-      await waitForBridgeReady(bridge.deviceId, bridge.port);
+      await Promise.race([waitForBridgeReady(bridge), waitForBridgeProcessExit(bridge)]);
       bridge.state = "running";
     } catch (error) {
       bridge.state = "failed";
-      bridge.lastError = (error as Error).message;
+      bridge.lastError = bridgeProcessMessageIfNeeded(bridge, (error as Error).message);
       bridge.process?.kill();
       bridge.process = undefined;
       throw error;
     }
   }
+}
+
+function appendOutputTail(previous: string | undefined, chunk: string, limit = 4_000): string {
+  const next = `${previous ?? ""}${chunk}`;
+  return next.length <= limit ? next : next.slice(next.length - limit);
+}
+
+function bridgeProcessMessage(bridge: BridgeContext, message: string): string {
+  const parts = [message];
+  if (bridge.stderrTail?.trim()) {
+    parts.push(`stderr: ${truncate(bridge.stderrTail.trim())}`);
+  }
+  if (bridge.stdoutTail?.trim()) {
+    parts.push(`stdout: ${truncate(bridge.stdoutTail.trim())}`);
+  }
+  return parts.join(" ");
+}
+
+function bridgeProcessMessageIfNeeded(bridge: BridgeContext, message: string): string {
+  if (message.includes("stderr:") || message.includes("stdout:")) {
+    return message;
+  }
+  return bridgeProcessMessage(bridge, message);
+}
+
+function waitForBridgeProcessExit(bridge: BridgeContext): Promise<never> {
+  const process = bridge.process;
+  if (!process) {
+    return Promise.reject(new AndroidBridgeError("Android bridge process was not started.", { deviceId: bridge.deviceId, port: bridge.port }));
+  }
+  return new Promise((_, reject) => {
+    process.once("exit", (code, signal) => {
+      reject(
+        new AndroidBridgeError(bridgeProcessMessage(bridge, `Android bridge process exited before becoming ready.`), {
+          deviceId: bridge.deviceId,
+          port: bridge.port,
+          code,
+          signal,
+          stdout: truncate(bridge.stdoutTail ?? ""),
+          stderr: truncate(bridge.stderrTail ?? "")
+        })
+      );
+    });
+    process.once("error", (error) => {
+      reject(
+        new AndroidBridgeError(`Android bridge process failed before becoming ready: ${error.message}`, {
+          deviceId: bridge.deviceId,
+          port: bridge.port,
+          stdout: truncate(bridge.stdoutTail ?? ""),
+          stderr: truncate(bridge.stderrTail ?? "")
+        })
+      );
+    });
+  });
 }
 
 const deviceManager = new DeviceManager();
@@ -463,24 +545,27 @@ async function adbTextForDevice(deviceId: string | undefined, args: string[], ti
   }
 }
 
-async function waitForBridgeReady(deviceId: string, port: number): Promise<void> {
-  const deadline = performance.now() + BRIDGE_TIMEOUT_MS;
+async function waitForBridgeReady(bridge: BridgeContext): Promise<void> {
+  const deadline = performance.now() + BRIDGE_STARTUP_TIMEOUT_MS;
   let lastError: Error | undefined;
   while (performance.now() <= deadline) {
     try {
-      await bridgeRpcOnPort(deviceId, port, "ping");
+      await bridgeRpcOnPort(bridge.deviceId, bridge.port, "ping", {}, BRIDGE_STARTUP_PROBE_TIMEOUT_MS);
       return;
     } catch (error) {
       lastError = error as Error;
-      await sleep(150);
+      await sleep(250);
     }
   }
-  throw new AndroidBridgeError("Android bridge did not become ready before timeout.", {
-    deviceId,
+  throw new AndroidBridgeError(bridgeProcessMessage(bridge, "Android bridge did not become ready before timeout."), {
+    deviceId: bridge.deviceId,
     host: BRIDGE_HOST,
-    port,
-    timeoutMs: BRIDGE_TIMEOUT_MS,
-    lastError: lastError?.message
+    port: bridge.port,
+    timeoutMs: BRIDGE_STARTUP_TIMEOUT_MS,
+    probeTimeoutMs: BRIDGE_STARTUP_PROBE_TIMEOUT_MS,
+    lastError: lastError?.message,
+    stdout: truncate(bridge.stdoutTail ?? ""),
+    stderr: truncate(bridge.stderrTail ?? "")
   });
 }
 
@@ -497,7 +582,8 @@ async function bridgeRpcOnPort(
   deviceId: string,
   port: number,
   method: string,
-  params: Record<string, string | number | boolean> = {}
+  params: Record<string, string | number | boolean> = {},
+  timeoutMs = BRIDGE_TIMEOUT_MS
 ): Promise<Record<string, unknown>> {
   const start = performance.now();
   const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -529,11 +615,11 @@ async function bridgeRpcOnPort(
           method,
           host: BRIDGE_HOST,
           port,
-          timeoutMs: BRIDGE_TIMEOUT_MS,
+          timeoutMs,
           hint: "Confirm the device is connected and android-server/build/android-ui-server.jar exists; the MCP server starts the bridge automatically."
         })
       );
-    }, BRIDGE_TIMEOUT_MS);
+    }, timeoutMs);
 
     socket.setEncoding("utf8");
     socket.on("connect", () => {
@@ -2339,7 +2425,13 @@ async function androidBridgePing(input: unknown): Promise<ToolResult> {
 async function androidBridgeExit(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
-  return normalizeBridgeSuccess(await androidBridgeRpc(deviceId, "exit"));
+  const bridge = deviceManager.runningBridge(deviceId);
+  if (!bridge) {
+    return { success: true, alreadyStopped: true, deviceId };
+  }
+  const response = await deviceManager.runOnDevice(deviceId, () => bridgeRpcOnPort(deviceId, bridge.port, "exit"));
+  deviceManager.stopBridge(deviceId);
+  return normalizeBridgeSuccess(response);
 }
 
 function normalizeBridgeSuccess(response: Record<string, unknown>): ToolResult {
