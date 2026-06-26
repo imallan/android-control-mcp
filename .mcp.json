@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "android-ui-mcp": {
+      "command": "/Users/allan/Documents/Codex/misc/Android Control MCP/scripts/start-desktop-mcp.sh",
+      "args": []
+    }
+  }
+}

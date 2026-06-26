@@ -42,7 +42,7 @@ type SemanticNode = {
   scrollable?: boolean;
   editable?: boolean;
   actions?: string[];
-  source: "accessibility" | "ocr";
+  source: "accessibility" | "ocr" | "vision";
   confidence?: number;
   score?: number;
 };
@@ -172,7 +172,10 @@ const REPO_DIR = join(MODULE_DIR, "..", "..");
 const ANDROID_SERVER_JAR = process.env.ANDROID_UI_MCP_JAR ?? join(REPO_DIR, "android-server", "build", "android-ui-server.jar");
 const APPLE_VISION_OCR_SOURCE = join(MODULE_DIR, "..", "apple-vision-ocr.swift");
 const APPLE_VISION_OCR_BIN = process.env.ANDROID_MCP_APPLE_VISION_OCR_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-ocr");
+const APPLE_VISION_DETECT_SOURCE = join(MODULE_DIR, "..", "apple-vision-detect.swift");
+const APPLE_VISION_DETECT_BIN = process.env.ANDROID_MCP_APPLE_VISION_DETECT_BIN ?? join(tmpdir(), "android-ui-mcp", "apple-vision-detect");
 const CLANG_MODULE_CACHE_DIR = join(tmpdir(), "android-ui-mcp", "clang-module-cache");
+const VISION_DETECT_TIMEOUT_MS = Number(process.env.ANDROID_MCP_VISION_DETECT_TIMEOUT_MS ?? 30_000);
 const SNAPSHOT_CACHE_LIMIT = 20;
 const DEFAULT_WAIT_TIMEOUT_MS = 5_000;
 const DEFAULT_WAIT_POLL_INTERVAL_MS = 300;
@@ -918,15 +921,27 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const deviceId = await deviceIdParam(params);
   const options = ocrOptions(params);
   const ocrMode = optionalEnumParam(params, "ocrMode", ["auto", "force", "off"] as const, "auto");
+  const visionMode = optionalEnumParam(params, "visionMode", ["auto", "force", "off"] as const, "auto");
   const includeScreenshot = optionalBooleanParam(params, "includeScreenshot", true);
   const includeRawTree = optionalBooleanParam(params, "includeRawTree", false);
+  const includeRawVision = optionalBooleanParam(params, "includeRawVision", false);
 
   const [screenshot, compact] = await Promise.all([androidScreenshot({ retain: options.retain, deviceId }), androidDumpCompact(deviceId)]);
   const accessibilityNodes = compactNodes(compact);
   const tree = assessTreeUsability(compact, accessibilityNodes);
   const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
-  const ocr = shouldRunOcr ? await runOcr(screenshot, options) : undefined;
-  const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], options.maxNodes);
+  const shouldRunVision = visionMode === "force" || (visionMode === "auto" && !tree.usable && shouldRunOcr);
+
+  // Run OCR and vision detection in parallel when both are needed
+  const [ocr, vision] = await Promise.all([
+    shouldRunOcr ? runOcr(screenshot, options) : Promise.resolve(undefined),
+    shouldRunVision ? runVisionDetect(screenshot.imagePath, { minSize: 28, maxSize: 320 }).catch((err: Error): undefined => {
+      process.stderr.write(`[android-ui-mcp] Vision detect failed (non-fatal): ${err.message}\n`);
+      return undefined;
+    }) : Promise.resolve(undefined)
+  ]);
+
+  const nodes = mergeSemanticNodes(accessibilityNodes, ocr?.nodes ?? [], vision?.nodes ?? [], options.maxNodes);
   const snapshot = createSemanticSnapshot(deviceId, compact, nodes);
   rememberSnapshot(snapshot);
 
@@ -943,13 +958,18 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
     ocrUsed: shouldRunOcr,
     ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
     ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
+    visionMode,
+    visionUsed: shouldRunVision,
+    visionEngine: shouldRunVision ? "apple-vision-detect" : undefined,
+    visionNodeCount: vision?.nodes.length ?? 0,
     treeUsable: tree.usable,
     accessibilityNodeCount: accessibilityNodes.length,
     ocrNodeCount: ocr?.nodes.length ?? 0,
     nodes: snapshot.nodes,
     nodeCount: snapshot.nodeCount,
     ...(includeRawTree ? { compactTree: compact } : {}),
-    ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {})
+    ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {}),
+    ...(includeRawVision && vision ? { rawVision: vision.rawDetect } : {})
   };
 }
 
@@ -1101,6 +1121,101 @@ function parseAppleVisionOcr(rawOcr: string, minConfidence: number, offsetX: num
   }
 
   return dedupeSemanticNodes(nodes).sort((a, b) => a.bounds[1] - b.bounds[1] || a.bounds[0] - b.bounds[0]);
+}
+
+// ---- Vision detection (icon / button regions) ----
+
+async function runVisionDetect(
+  imagePath: string,
+  options: { minSize?: number; maxSize?: number; edgeThreshold?: number }
+): Promise<{ nodes: SemanticNode[]; rawDetect: string; engine: string; elapsedMs: number }> {
+  const start = performance.now();
+  const bin = await ensureAppleVisionDetectBin();
+  const args = [imagePath];
+  if (options.minSize !== undefined) {
+    args.push("--min-size", String(options.minSize));
+  }
+  if (options.maxSize !== undefined) {
+    args.push("--max-size", String(options.maxSize));
+  }
+  if (options.edgeThreshold !== undefined) {
+    args.push("--edge-threshold", String(options.edgeThreshold));
+  }
+  const rawDetect = await execText(bin, args, VISION_DETECT_TIMEOUT_MS);
+  const nodes = parseAppleVisionDetect(rawDetect);
+  return { nodes, rawDetect, engine: "apple-vision-detect", elapsedMs: performance.now() - start };
+}
+
+async function ensureAppleVisionDetectBin(): Promise<string> {
+  try {
+    await access(APPLE_VISION_DETECT_BIN);
+    return APPLE_VISION_DETECT_BIN;
+  } catch {
+    await mkdir(dirname(APPLE_VISION_DETECT_BIN), { recursive: true });
+    await mkdir(CLANG_MODULE_CACHE_DIR, { recursive: true });
+    await execText("swiftc", [APPLE_VISION_DETECT_SOURCE, "-o", APPLE_VISION_DETECT_BIN], VISION_DETECT_TIMEOUT_MS);
+    return APPLE_VISION_DETECT_BIN;
+  }
+}
+
+function parseAppleVisionDetect(rawDetect: string): SemanticNode[] {
+  const parsed = expectObject(JSON.parse(rawDetect));
+  const rawNodes = parsed.nodes;
+  if (!Array.isArray(rawNodes)) {
+    throw new Error("Apple Vision detect output did not include nodes.");
+  }
+
+  const nodes: SemanticNode[] = [];
+  for (const [index, rawNode] of rawNodes.entries()) {
+    const node = expectObject(rawNode);
+    const rawBounds = node.bounds;
+    if (!Array.isArray(rawBounds) || rawBounds.length !== 4 || !rawBounds.every((value) => Number.isInteger(value) && value >= 0)) {
+      continue;
+    }
+    const bounds: Bounds = [
+      rawBounds[0] as number,
+      rawBounds[1] as number,
+      rawBounds[2] as number,
+      rawBounds[3] as number
+    ];
+    const width = bounds[2] - bounds[0];
+    const height = bounds[3] - bounds[1];
+    // Skip degenerate regions
+    if (width < 10 || height < 10) {
+      continue;
+    }
+    const confidence = typeof node.confidence === "number" ? node.confidence : 50;
+    nodes.push({
+      id: `vision:${index + 1}`,
+      bounds,
+      center: boundsCenter(bounds),
+      clickable: true,
+      source: "vision",
+      confidence,
+      role: "icon"
+    });
+  }
+
+  return nodes;
+}
+
+/// Remove vision detections that significantly overlap with existing accessibility or OCR text.
+function filterVisionVsExisting(visionNodes: SemanticNode[], existingNodes: SemanticNode[]): SemanticNode[] {
+  return visionNodes.filter((vn) => {
+    const vText = (vn.text ?? "").trim();
+    for (const en of existingNodes) {
+      const eText = (en.text ?? en.contentDesc ?? "").trim();
+      // If the vision region contains readable text that is already covered, skip it.
+      if (eText.length > 0 && boundsOverlapRatio(vn.bounds, en.bounds) > 0.6) {
+        return false;
+      }
+      // If the vision region is mostly covered by an accessibility node, skip it.
+      if (en.source === "accessibility" && boundsOverlapRatio(vn.bounds, en.bounds) > 0.7) {
+        return false;
+      }
+    }
+    return true;
+  });
 }
 
 async function cropImage(screenshot: ScreenshotResult, roi: Bounds): Promise<{ imagePath: string; offsetX: number; offsetY: number }> {
@@ -1302,8 +1417,10 @@ function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNo
   return { usable: true, reason: "tree_usable" };
 }
 
-function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: SemanticNode[], maxNodes: number): SemanticNode[] {
-  const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes]);
+function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: SemanticNode[], visionNodes: SemanticNode[], maxNodes: number): SemanticNode[] {
+  // Filter vision detections against accessibility + OCR nodes to avoid duplicates
+  const filteredVision = filterVisionVsExisting(visionNodes, [...accessibilityNodes, ...ocrNodes]);
+  const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes, ...filteredVision]);
   return assignSnapshotRefs(rankSemanticNodes(merged).slice(0, maxNodes));
 }
 
@@ -1336,10 +1453,18 @@ function rankSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
 function assignSnapshotRefs(nodes: SemanticNode[]): SemanticNode[] {
   let accessibilityIndex = 0;
   let ocrIndex = 0;
-  return nodes.map((node) => ({
-    ...node,
-    ref: node.source === "accessibility" ? `a${++accessibilityIndex}` : `o${++ocrIndex}`
-  }));
+  let visionIndex = 0;
+  return nodes.map((node) => {
+    let ref: string;
+    if (node.source === "accessibility") {
+      ref = `a${++accessibilityIndex}`;
+    } else if (node.source === "vision") {
+      ref = `v${++visionIndex}`;
+    } else {
+      ref = `o${++ocrIndex}`;
+    }
+    return { ...node, ref };
+  });
 }
 
 function inferNodeRole(node: SemanticNode): string | undefined {
@@ -1370,7 +1495,7 @@ function isNodeEditable(node: SemanticNode, role?: string): boolean {
 }
 
 function scoreSemanticNode(node: SemanticNode): number {
-  let score = node.source === "accessibility" ? 0.4 : 0.2;
+  let score = node.source === "accessibility" ? 0.4 : node.source === "vision" ? 0.25 : 0.2;
   if (node.editable) {
     score += 0.5;
   }
@@ -1403,7 +1528,7 @@ function actionNames(node: SemanticNode): string[] {
 }
 
 function sourceRank(source: SemanticNode["source"]): number {
-  return source === "accessibility" ? 0 : 1;
+  return source === "accessibility" ? 0 : source === "vision" ? 1 : 2;
 }
 
 function createSemanticSnapshot(deviceId: string, compact: Record<string, unknown>, nodes: SemanticNode[]): SemanticSnapshot {
@@ -1435,7 +1560,7 @@ function rememberSnapshot(snapshot: SemanticSnapshot): void {
 
 function currentAccessibilitySnapshot(deviceId: string): Promise<SemanticSnapshot> {
   return androidDumpCompact(deviceId).then((compact) => {
-    const nodes = mergeSemanticNodes(compactNodes(compact), [], 80);
+    const nodes = mergeSemanticNodes(compactNodes(compact), [], [], 80);
     const snapshot = createSemanticSnapshot(deviceId, compact, nodes);
     rememberSnapshot(snapshot);
     return snapshot;
@@ -1639,7 +1764,7 @@ async function resolveAccessibilityRef(snapshotId: string, ref: string, requeste
     return {
       ok: false,
       status: "unsupported_ref_source",
-      message: "OCR refs are observation-only and cannot be used as ref action targets in v1.",
+      message: `${originalNode.source === "vision" ? "Vision" : "OCR"} refs are observation-only and cannot be used as ref action targets. Only accessibility (a*) refs are action-capable.`,
       snapshotId,
       ref,
       cached,
@@ -2767,14 +2892,16 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_get_semantic_screen",
-    description: "Return a unified compact screen model from accessibility nodes, with optional or automatic OCR fallback for sparse trees.",
+    description: "Return a unified compact screen model from accessibility nodes, with optional or automatic OCR and visual-icon fallback for sparse trees.",
     inputSchema: {
       type: "object",
       properties: {
         ...deviceProperties,
         ocrMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
+        visionMode: { type: "string", enum: ["auto", "force", "off"], default: "auto", description: "Visual icon/button detection mode. auto: run when accessibility tree is sparse. force: always run. off: never run." },
         includeScreenshot: { type: "boolean", default: true },
         includeRawTree: { type: "boolean", default: false },
+        includeRawVision: { type: "boolean", default: false },
         ...ocrCommonProperties
       },
       additionalProperties: false
