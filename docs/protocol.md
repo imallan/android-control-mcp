@@ -9,12 +9,17 @@ Bridge-backed MCP tools:
 - `android_list_devices`
 - `android_bridge_ping`
 - `android_bridge_exit`
+- `android_capabilities`
+- `android_trace_start`
+- `android_trace_stop`
+- `android_trace_status`
 - `android_create_virtual_display`
 - `android_destroy_virtual_display`
 - `android_list_displays`
 - `android_current_app`
 - `android_wait_for_package`
 - `android_wait_for_text`
+- `android_wait_for_ref_gone`
 - `android_wait_for_screen_change`
 - `android_get_semantic_screen`
 - `android_dump_tree`
@@ -32,6 +37,12 @@ Bridge-backed MCP tools:
 - `android_input_text`
 - `android_key`
 - `android_go_home`
+- `android_open_notifications`
+- `android_open_quick_settings`
+- `android_close_keyboard`
+- `android_grant_permission_dialog`
+- `android_open_recents`
+- `android_switch_recent_app`
 - `android_perform_action`
 - `android_long_press`
 - `android_list_apps`
@@ -133,6 +144,34 @@ Wait and recovery tools:
 - `android_wait_for_screen_change`: polls accessibility snapshots until `screenSignature` changes from a supplied `snapshotId`, supplied `screenSignature`, or an initial baseline captured by the tool.
 
 Wait tools accept `timeoutMs` and `pollIntervalMs` and return `success: true` when the condition is met, otherwise `success: false` with a timeout status and the latest observed state.
+
+Mutating tools accept an optional `after` object with `waitForText` and/or
+`waitForPackage`, plus timeout/poll settings. The tool result includes the nested
+wait results and reports `success: false` when a requested postcondition times out.
+`android_wait_for_ref_gone` binds the original accessibility ref to its device and
+display/session and waits until conservative relocation can no longer find it.
+
+## OCR Cache
+
+OCR results are cached in a bounded process-local LRU keyed by image bytes, engine,
+languages, confidence, crop offset, and ROI-derived image. Results expose
+`ocrCached`. Restarting the desktop MCP clears the cache.
+
+## Trace Capture
+
+`android_trace_start`, `android_trace_status`, and `android_trace_stop` manage one
+active local trace. Each non-trace tool records sanitized input, result/error,
+elapsed time, semantic context present in the result, and a copied screenshot when
+`imagePath` is returned. The default directory is
+the OS temporary directory's `android-ui-mcp/traces/<trace-id>/`; override its root with
+`ANDROID_MCP_TRACE_DIR`.
+
+## Capability Groups
+
+Groups are `core`, `ocr`, `apps`, `debug`, `trace`, and `vision`. By default all are
+enabled. Set comma-separated `ANDROID_MCP_CAPABILITIES` before server startup to
+restrict exposed/callable tools. `tools/list` also accepts a `capabilities` array for
+request-time filtering, and each tool carries its group in `_meta`.
 
 OCR-backed tools accept `ocrEngine`:
 

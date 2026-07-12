@@ -158,7 +158,7 @@ Failure responses should be designed for the next agent step, not just for loggi
 > **Current status:** `android_wait_for_text`, `android_wait_for_package`,
 > `android_wait_for_screen_change`, and `android_current_app` are implemented.
 > `android_wait_for_ref_gone` and `after.waitForText` / `after.waitForPackage`
-> post-action conditions are **not yet implemented**.
+> post-action conditions are implemented.
 
 ## Priority 5: Action Result Should Return Fresh Context
 
@@ -204,7 +204,7 @@ Suggested path:
 /tmp/android-ui-mcp/traces/<trace-id>/
 ```
 
-> **Current status:** Not yet implemented.
+> **Current status:** Implemented with local sanitized JSON/JSONL events, copied screenshots, and start/stop/status tools.
 
 ## Priority 7: Capability Groups
 
@@ -221,7 +221,7 @@ Suggested groups:
 
 This mirrors Playwright MCP's capability approach and helps reduce tool confusion and token cost.
 
-> **Current status:** Not yet implemented.
+> **Current status:** Implemented through `ANDROID_MCP_CAPABILITIES`, request-time `tools/list` filtering, per-tool metadata, and `android_capabilities`.
 
 ## Priority 8: Android System Workflow Helpers
 
@@ -240,8 +240,7 @@ Recommended tools:
 
 These tools make the MCP useful for real-device tasks that browser MCPs cannot cover.
 
-> **Current status:** `android_current_app` and `android_go_home` are implemented. All other system
-> workflow helpers listed above are **not yet implemented**.
+> **Current status:** All listed system workflow helpers are implemented.
 
 ## Priority 9: Test And Fake-Bridge Coverage
 
@@ -260,8 +259,7 @@ Highest-value tests:
 
 The goal is not a full UI test framework. The goal is confidence that the MCP gives agents reliable observations, actions, and recovery data.
 
-> **Current status:** Automated tests and fake-bridge integration tests are
-> not yet implemented.
+> **Current status:** Semantic contract, trace, input validation, fake-bridge, and API 37 end-to-end tests are implemented, including a real runtime-permission dialog and weak-accessibility Camera OCR/vision fallback.
 
 ## Lower Priority Or Out Of Scope For Now
 
@@ -286,5 +284,4 @@ Defer these unless a concrete user need appears:
 7. Add local trace capture.
 8. Split tools into capability groups.
 
-> **Status:** Items 1–6 are implemented. Items 7 (trace capture) and 8
-> (capability groups) are not yet implemented.
+> **Status:** Items 1–8 are implemented.

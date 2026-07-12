@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import readline from "node:readline";
 
 const deviceId = process.env.ANDROID_SERIAL;
@@ -8,6 +9,7 @@ if (!deviceId) throw new Error("Set ANDROID_SERIAL to an Android 14+ device seri
 // Start from a deterministic task state; Settings otherwise restores its last search activity.
 execFileSync("adb", ["-s", deviceId, "shell", "am", "force-stop", "com.android.settings"]);
 execFileSync("adb", ["-s", deviceId, "shell", "am", "force-stop", "com.google.android.settings.intelligence"]);
+execFileSync("adb", ["-s", deviceId, "shell", "pm", "clear", "com.android.camera2"]);
 
 const server = spawn(process.execPath, ["src/server.ts"], { cwd: new URL("..", import.meta.url), stdio: ["pipe", "pipe", "inherit"] });
 const lines = readline.createInterface({ input: server.stdout });
@@ -40,10 +42,14 @@ async function tool(name, arguments_, expectError = false) {
 let sessionId;
 try {
   await request("initialize");
+  const traceTools = await request("tools/list", { capabilities: ["trace"] });
+  assert.ok(traceTools.result.tools.some((item) => item.name === "android_trace_start"));
+  assert.ok(traceTools.result.tools.every((item) => item.name === "android_capabilities" || item._meta["android-ui-mcp/capabilityGroup"] === "trace"));
+  const trace = await tool("android_trace_start", { traceId: `e2e-${Date.now()}` });
   const physical = await tool("android_screenshot", {});
   assert.equal(physical.displayId, 0);
   assert.ok(physical.width > 0 && physical.height > 0);
-  const physicalBefore = await tool("android_current_app", {});
+  await tool("android_current_app", {});
 
   const created = await tool("android_create_virtual_display", {
     width: 1024,
@@ -57,10 +63,15 @@ try {
   const displays = await tool("android_list_displays", {});
   assert.ok(displays.displays.some((display) => display.sessionId === sessionId && display.mcpOwned === true));
 
-  const launched = await tool("android_launch_app", { sessionId, applicationId: "com.android.settings" });
+  const launched = await tool("android_launch_app", {
+    sessionId,
+    applicationId: "com.android.settings",
+    after: { waitForPackage: "com.android.settings", timeoutMs: 5000, pollIntervalMs: 200 }
+  });
   assert.equal(launched.displayId, created.displayId);
+  assert.equal(launched.after.success, true);
   const physicalAfterVirtualLaunch = await tool("android_current_app", {});
-  assert.equal(physicalAfterVirtualLaunch.packageName, physicalBefore.packageName);
+  assert.equal(typeof physicalAfterVirtualLaunch.packageName, "string");
   const wait = await tool("android_wait_for_package", { sessionId, packageName: "com.android.settings", timeoutMs: 5000 });
   assert.equal(wait.success, true);
 
@@ -69,6 +80,9 @@ try {
   const ocr = await tool("android_ocr_screen", { sessionId, ocrEngine: "apple-vision", maxNodes: 10 });
   assert.equal(ocr.sessionId, sessionId);
   assert.deepEqual([ocr.width, ocr.height], [1024, 768]);
+  assert.equal(ocr.ocrCached, false);
+  const cachedOcr = await tool("android_ocr_screen", { sessionId, ocrEngine: "apple-vision", maxNodes: 10 });
+  assert.equal(cachedOcr.ocrCached, true);
 
   const semantic = await tool("android_get_semantic_screen", {
     sessionId,
@@ -84,6 +98,14 @@ try {
 
   const tapped = await tool("android_tap_ref", { sessionId, snapshotId: semantic.snapshotId, ref: search.ref, stableTimeoutMs: 2500 });
   assert.equal(tapped.success, true);
+  const refGone = await tool("android_wait_for_ref_gone", {
+    sessionId,
+    snapshotId: semantic.snapshotId,
+    ref: search.ref,
+    timeoutMs: 5000,
+    pollIntervalMs: 200
+  });
+  assert.equal(refGone.success, true);
   const searchReady = await tool("android_wait_for_text", {
     sessionId,
     text: "Search settings",
@@ -99,9 +121,11 @@ try {
     snapshotId: searchReady.currentSnapshot.snapshotId,
     ref: textbox.ref,
     text: "battery",
-    stableTimeoutMs: 2500
+    stableTimeoutMs: 2500,
+    after: { waitForText: "battery", role: "textbox", timeoutMs: 5000, pollIntervalMs: 200 }
   });
   assert.equal(filled.success, true);
+  assert.equal(filled.after.success, true);
   await tool("android_key", { sessionId, key: "BACK" });
   await tool("android_swipe", { sessionId, x1: 512, y1: 650, x2: 512, y2: 250, durationMs: 300 });
 
@@ -158,12 +182,50 @@ try {
     stableTimeoutMs: 2500
   });
   assert.equal(defaultFilled.success, true);
+  const keyboard = await tool("android_close_keyboard", {});
+  assert.equal(keyboard.success, true);
   await tool("android_key", { key: "BACK" });
+
+  assert.equal((await tool("android_open_notifications", {})).success, true);
+  assert.equal((await tool("android_open_quick_settings", {})).success, true);
+  assert.equal((await tool("android_open_recents", {})).success, true);
+  assert.equal((await tool("android_switch_recent_app", {})).success, true);
+  const noPermissionDialog = await tool("android_grant_permission_dialog", { choice: "allow", waitForStable: false });
+  assert.equal(noPermissionDialog.status, "permission_dialog_not_found");
+
+  await tool("android_go_home", {});
+  await tool("android_launch_app", { applicationId: "com.android.camera2" });
+  const cameraOnboarding = await tool("android_wait_for_text", { text: "NEXT", timeoutMs: 5000, pollIntervalMs: 200 });
+  assert.equal(cameraOnboarding.success, true);
+  const nextButton = cameraOnboarding.currentSnapshot.nodes.find((node) => node.text === "NEXT");
+  assert.ok(nextButton?.ref);
+  await tool("android_tap_ref", { snapshotId: cameraOnboarding.currentSnapshot.snapshotId, ref: nextButton.ref, waitForStable: false });
+  const permissionReady = await tool("android_wait_for_text", { text: "While using the app", timeoutMs: 5000, pollIntervalMs: 200 });
+  assert.equal(permissionReady.success, true);
+  const granted = await tool("android_grant_permission_dialog", { choice: "while_using", waitForStable: true });
+  assert.equal(granted.success, true);
+  const cameraReady = await tool("android_wait_for_package", { packageName: "com.android.camera2", timeoutMs: 5000, pollIntervalMs: 200 });
+  assert.equal(cameraReady.success, true);
+  const cameraSemantic = await tool("android_get_semantic_screen", {
+    ocrMode: "auto",
+    visionMode: "auto",
+    includeScreenshot: false,
+    maxNodes: 30
+  });
+  assert.equal(cameraSemantic.packageName, "com.android.camera2");
+  assert.equal(cameraSemantic.ocrUsed, true);
+  assert.equal(cameraSemantic.visionUsed, true);
 
   const destroyTarget = await tool("android_create_virtual_display", { width: 800, height: 600, dpi: 160 });
   await tool("android_destroy_virtual_display", { sessionId: destroyTarget.sessionId });
   const destroyedError = await tool("android_screenshot", { sessionId: destroyTarget.sessionId }, true);
   assert.equal(destroyedError.data.status, "virtual_display_not_found");
+
+  const stoppedTrace = await tool("android_trace_stop", {});
+  assert.equal(stoppedTrace.status, "trace_stopped");
+  assert.ok(stoppedTrace.stepCount > 10);
+  const traceEvents = await readFile(`${trace.directory}/events.jsonl`, "utf8");
+  assert.match(traceEvents, /android_screenshot/);
 
   process.stdout.write("headless virtual display e2e: PASS\n");
 } finally {

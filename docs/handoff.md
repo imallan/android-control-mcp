@@ -22,11 +22,16 @@ replacement, or bridge restart.
 
 Bridge-backed tools:
 
+- `android_capabilities`
+- `android_trace_start`
+- `android_trace_stop`
+- `android_trace_status`
 - `android_bridge_ping`
 - `android_bridge_exit`
 - `android_current_app`
 - `android_wait_for_package`
 - `android_wait_for_text`
+- `android_wait_for_ref_gone`
 - `android_wait_for_screen_change`
 - `android_dump_tree`
 - `android_dump_compact`
@@ -43,6 +48,12 @@ Bridge-backed tools:
 - `android_long_press`
 - `android_key`
 - `android_go_home`
+- `android_open_notifications`
+- `android_open_quick_settings`
+- `android_close_keyboard`
+- `android_grant_permission_dialog`
+- `android_open_recents`
+- `android_switch_recent_app`
 - `android_list_apps`
 - `android_launch_app`
 
@@ -172,6 +183,13 @@ Previously verified behavior:
 - `android_launch_app` works by deterministic `applicationId` and by unique app-name match.
 - Xiaohongshu (`com.xingin.xhs`) exposes a useful accessibility tree.
 - WeChat (`com.tencent.mm`) can launch, but often exposes a sparse accessibility tree.
+
+Latest hardening checks on 2026-07-12:
+
+- `npm test` passes semantic ranking/deduplication, stale-ref ambiguity, display identity, after-condition validation, capability grouping, and trace lifecycle tests.
+- `npm run test:fake-bridge` passes local-socket request/response and bridge-error normalization tests.
+- `npm run test:headless` passes API 37 default/virtual display, OCR cache miss/hit, post-action waits, ref-gone, trace, capability filtering, all system workflow helpers, a real Camera runtime-permission dialog grant, and Camera weak-accessibility OCR/vision fallback.
+- `./gradlew :android-server:buildUiautomatorJar` and `npm run build` pass.
 
 ## New Session Test Plan
 
@@ -434,28 +452,20 @@ To bypass stability waiting for a tool call:
 - `uiautomator` exposes the accessibility tree, not the full rendered view tree.
 - WebView, OpenGL, game, video, and some Compose screens may expose little or no useful accessibility data.
 - `FLAG_SECURE` windows can block screenshots.
-- The OCR fallback is text-only. It does not detect icon-only buttons or visual grouping.
+- OCR is text-focused; Apple Vision icon/button detection supplies a separate visual fallback, while large CV models remain intentionally out of scope.
 - Apple Vision quality is much better for Chinese UI text than Tesseract in early tests, but it requires macOS and system language support.
-- Automated tests are still minimal.
-- OCR cache is not yet implemented; every OCR call re-runs the full pipeline.
-- CV/object detection (OpenCV, YOLO, PaddleOCR) is not implemented.
-- Trace tools (`android_trace_start`, `android_trace_stop`, `android_trace_status`) are not implemented.
-- Capability groups are not implemented.
-- System workflow helpers (`android_open_notifications`, `android_open_quick_settings`, `android_close_keyboard`, `android_grant_permission_dialog`, `android_open_recents`, `android_switch_recent_app`) are not implemented.
-- `android_wait_for_ref_gone` is not implemented.
-- `after.waitForText` / `after.waitForPackage` post-action conditions are not implemented.
-- Automated fake-bridge integration tests are not implemented.
+- OCR uses a bounded in-memory content/parameter LRU cache; cache state is process-local.
+- Trace artifacts are local files under the OS temporary directory's `android-ui-mcp/traces` folder by default and are not automatically uploaded or pruned.
+- Capability groups are configured with `ANDROID_MCP_CAPABILITIES`; changing them requires restarting the MCP server.
+- Runtime-permission button wording varies by Android/OEM; `android_grant_permission_dialog` returns `permission_dialog_not_found` rather than guessing when no supported label is unique.
+- Large CV/object-detection stacks such as YOLO or PaddleOCR remain out of scope; the built-in visual fallback uses Apple Vision.
 
-## Recommended Next Work
+## Optional Compatibility Follow-ups
 
-Highest priority:
+- Continue sampling OCR/vision behavior on additional third-party apps and OEM ROMs; Camera and WeChat-specific sparse-app routing are already covered.
+- Tune OCR region/merge heuristics only from observed device-specific failures.
+- Extend the compatibility matrix as more Android 14+ physical devices become available.
 
-- Test OCR fallback on real weak-accessibility apps such as WeChat.
-- Improve OCR region selection and merging heuristics after real-device runs.
-
-Hardening:
-
-- Add `android_devices`.
-- Add bridge health diagnostics and clearer startup failure messages.
-- Add structured tests for MCP request handling, input validation, bridge error normalization, and selector behavior.
-- Update compatibility notes as more devices and Android versions are tested.
+Completed hardening includes `android_list_devices`, managed bridge health diagnostics,
+input/selector/semantic contract tests, local-socket fake-bridge tests, trace tests, and
+an API 37 end-to-end test covering default and virtual displays.

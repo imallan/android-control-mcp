@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { access, appendFile, copyFile, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
@@ -139,6 +139,7 @@ type ToolDefinition = {
   inputSchema: Record<string, unknown>;
   handler: (input: unknown) => Promise<ToolResult>;
 };
+type CapabilityGroup = "core" | "ocr" | "apps" | "debug" | "trace" | "vision";
 
 type AdbDeviceState = "device" | "offline" | "unauthorized" | string;
 
@@ -191,10 +192,21 @@ const DEFAULT_VIRTUAL_DISPLAY_WIDTH = 1280;
 const DEFAULT_VIRTUAL_DISPLAY_HEIGHT = 960;
 const DEFAULT_VIRTUAL_DISPLAY_DPI = 160;
 const DEFAULT_VIRTUAL_FRAME_TIMEOUT_MS = 2_000;
+const OCR_CACHE_LIMIT = 20;
+const TRACE_ROOT = process.env.ANDROID_MCP_TRACE_DIR ?? join(tmpdir(), "android-ui-mcp", "traces");
+const ALL_CAPABILITY_GROUPS: CapabilityGroup[] = ["core", "ocr", "apps", "debug", "trace", "vision"];
+const enabledCapabilityGroups = new Set<CapabilityGroup>(
+  (process.env.ANDROID_MCP_CAPABILITIES?.split(",").map((value) => value.trim()).filter((value): value is CapabilityGroup => ALL_CAPABILITY_GROUPS.includes(value as CapabilityGroup))
+    ?? ALL_CAPABILITY_GROUPS)
+);
 
 const snapshotCache = new Map<string, SnapshotCacheEntry>();
 const activeVirtualSessions = new Map<string, string>();
 const staleVirtualSessions = new Map<string, "bridge_restarted" | "virtual_display_recreated" | "virtual_display_not_found">();
+const ocrCache = new Map<string, { nodes: SemanticNode[]; rawOcr: string }>();
+
+type TraceState = { traceId: string; directory: string; startedAt: string; step: number };
+let activeTrace: TraceState | undefined;
 
 function invalidateSnapshots(deviceId: string, sessionId?: string): void {
   for (const [snapshotId, snapshot] of snapshotCache) {
@@ -218,6 +230,7 @@ const KEYCODES: Record<string, string> = {
   HOME: "KEYCODE_HOME",
   ENTER: "KEYCODE_ENTER",
   APP_SWITCH: "KEYCODE_APP_SWITCH",
+  ESCAPE: "KEYCODE_ESCAPE",
   DEL: "KEYCODE_DEL"
 };
 
@@ -657,9 +670,29 @@ async function bridgeRpcOnPort(
   params: Record<string, string | number | boolean> = {},
   timeoutMs = BRIDGE_TIMEOUT_MS
 ): Promise<Record<string, unknown>> {
+  return bridgeRpcAtEndpoint(deviceId, { host: BRIDGE_HOST, port }, method, params, timeoutMs);
+}
+
+async function bridgeRpcOnSocket(
+  deviceId: string,
+  path: string,
+  method: string,
+  params: Record<string, string | number | boolean> = {},
+  timeoutMs = BRIDGE_TIMEOUT_MS
+): Promise<Record<string, unknown>> {
+  return bridgeRpcAtEndpoint(deviceId, { path }, method, params, timeoutMs);
+}
+
+async function bridgeRpcAtEndpoint(
+  deviceId: string,
+  endpoint: { host: string; port: number } | { path: string },
+  method: string,
+  params: Record<string, string | number | boolean>,
+  timeoutMs: number
+): Promise<Record<string, unknown>> {
   const start = performance.now();
   const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
-    const socket = net.createConnection({ host: BRIDGE_HOST, port });
+    const socket = net.createConnection(endpoint);
     let buffer = "";
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -685,8 +718,7 @@ async function bridgeRpcOnPort(
         new AndroidBridgeError("Android bridge request timed out.", {
           deviceId,
           method,
-          host: BRIDGE_HOST,
-          port,
+          ...endpoint,
           timeoutMs,
           hint: "Confirm the device is connected and android-server/build/android-ui-server.jar exists; the MCP server starts the bridge automatically."
         })
@@ -715,8 +747,7 @@ async function bridgeRpcOnPort(
         new AndroidBridgeError(`Android bridge connection failed: ${error.message}`, {
           deviceId,
           method,
-          host: BRIDGE_HOST,
-          port,
+          ...endpoint,
           hint: "The MCP server starts the bridge automatically; check android_list_devices for bridge state and lastError."
         })
       );
@@ -1039,6 +1070,7 @@ async function androidOcrScreen(input: unknown): Promise<ToolResult> {
     nodeCount: Math.min(ocr.nodes.length, options.maxNodes),
     totalNodeCount: ocr.nodes.length,
     ocrElapsedMs: ocr.elapsedMs,
+    ocrCached: ocr.cached,
     ...(options.includeRawOcr ? { rawOcr: ocr.rawOcr } : {})
   };
 }
@@ -1098,6 +1130,7 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
     treeUsable: tree.usable,
     accessibilityNodeCount: accessibilityNodes.length,
     ocrNodeCount: ocr?.nodes.length ?? 0,
+    ocrCached: ocr?.cached ?? false,
     nodes: snapshot.nodes,
     nodeCount: snapshot.nodeCount,
     ...(includeRawTree ? { compactTree: compact } : {}),
@@ -1134,18 +1167,34 @@ function ocrOptions(input: unknown): {
 async function runOcr(
   screenshot: ScreenshotResult,
   options: { roi?: Bounds; langs: string; ocrEngine: OcrEngine; minConfidence: number }
-): Promise<{ nodes: SemanticNode[]; rawOcr: string; elapsedMs: number }> {
+): Promise<{ nodes: SemanticNode[]; rawOcr: string; elapsedMs: number; cached: boolean }> {
   const start = performance.now();
   const target = options.roi ? await cropImage(screenshot, options.roi) : { imagePath: screenshot.imagePath, offsetX: 0, offsetY: 0 };
+  const image = await readFile(target.imagePath);
+  const cacheKey = createHash("sha256")
+    .update(image)
+    .update(JSON.stringify({ engine: options.ocrEngine, langs: options.langs, minConfidence: options.minConfidence, offsetX: target.offsetX, offsetY: target.offsetY }))
+    .digest("hex");
+  const cached = ocrCache.get(cacheKey);
+  if (cached) {
+    ocrCache.delete(cacheKey);
+    ocrCache.set(cacheKey, cached);
+    return { ...cached, elapsedMs: Math.round(performance.now() - start), cached: true };
+  }
   const result =
     options.ocrEngine === "apple-vision"
       ? await runAppleVisionOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY)
       : await runTesseractOcr(target.imagePath, options.langs, options.minConfidence, target.offsetX, target.offsetY);
-  return {
+  const entry = {
     nodes: result.nodes,
-    rawOcr: result.rawOcr,
-    elapsedMs: Math.round(performance.now() - start)
+    rawOcr: result.rawOcr
   };
+  ocrCache.set(cacheKey, entry);
+  while (ocrCache.size > OCR_CACHE_LIMIT) {
+    const oldest = ocrCache.keys().next().value as string | undefined;
+    if (oldest) ocrCache.delete(oldest);
+  }
+  return { ...entry, elapsedMs: Math.round(performance.now() - start), cached: false };
 }
 
 async function runTesseractOcr(
@@ -1530,7 +1579,7 @@ function compactNodes(compact: Record<string, unknown>): SemanticNode[] {
 
 function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNode[]): { usable: boolean; reason: string } {
   const packageName = typeof compact.packageName === "string" ? compact.packageName : "";
-  if (["com.tencent.mm"].includes(packageName)) {
+  if (["com.tencent.mm", "com.android.camera2"].includes(packageName)) {
     return { usable: false, reason: "known_sparse_accessibility_app" };
   }
   if (nodes.length === 0) {
@@ -2146,6 +2195,51 @@ function waitOptions(input: Record<string, unknown>): { timeoutMs: number; pollI
   };
 }
 
+function afterConditions(input: unknown): Record<string, unknown> | undefined {
+  const params = optionalObject(input);
+  if (params.after === undefined) return undefined;
+  const after = expectObject(params.after);
+  const waitForText = optionalStringParam(after, "waitForText");
+  const waitForPackage = optionalStringParam(after, "waitForPackage");
+  if (!waitForText && !waitForPackage) {
+    throw new ToolInputError("after must include waitForText and/or waitForPackage.");
+  }
+  return after;
+}
+
+async function runAfterConditions(input: unknown): Promise<ToolResult | undefined> {
+  const after = afterConditions(input);
+  if (!after) return undefined;
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  const timeoutMs = optionalIntegerParam(after, "timeoutMs", DEFAULT_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = optionalIntegerParam(after, "pollIntervalMs", DEFAULT_WAIT_POLL_INTERVAL_MS);
+  const results: ToolResult = {};
+  let success = true;
+  const waitForText = optionalStringParam(after, "waitForText");
+  if (waitForText) {
+    const result = await androidWaitForText({
+      deviceId,
+      ...target,
+      text: waitForText,
+      role: optionalStringParam(after, "role"),
+      fuzzy: optionalBooleanParam(after, "fuzzy", false),
+      timeoutMs,
+      pollIntervalMs
+    });
+    results.waitForText = result;
+    success = success && result.success === true;
+  }
+  const waitForPackage = optionalStringParam(after, "waitForPackage");
+  if (waitForPackage) {
+    const result = await androidWaitForPackage({ deviceId, ...target, packageName: waitForPackage, timeoutMs, pollIntervalMs });
+    results.waitForPackage = result;
+    success = success && result.success === true;
+  }
+  return { success, ...results };
+}
+
 function stableSnapshotOptions(input: Record<string, unknown>): { waitForStable: boolean; stableTimeoutMs: number; stablePollIntervalMs: number } {
   return {
     waitForStable: optionalBooleanParam(input, "waitForStable", true),
@@ -2638,6 +2732,70 @@ async function androidGoHome(input: unknown): Promise<ToolResult> {
   return normalizeBridgeSuccess({ ...response, key: "HOME", keycode: KEYCODES.HOME });
 }
 
+function requireDefaultDisplay(target: DisplayTarget, toolName: string): void {
+  if (target.sessionId || (target.displayId !== undefined && target.displayId !== 0)) {
+    throw new ToolInputError(`${toolName} supports display 0 only.`);
+  }
+}
+
+async function androidOpenNotifications(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  requireDefaultDisplay(displayTargetParams(params), "android_open_notifications");
+  await adbTextForDevice(deviceId, ["shell", "cmd", "statusbar", "expand-notifications"]);
+  return { success: true, status: "notifications_opened", deviceId, displayId: 0 };
+}
+
+async function androidOpenQuickSettings(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  requireDefaultDisplay(displayTargetParams(params), "android_open_quick_settings");
+  await adbTextForDevice(deviceId, ["shell", "cmd", "statusbar", "expand-settings"]);
+  return { success: true, status: "quick_settings_opened", deviceId, displayId: 0 };
+}
+
+async function androidCloseKeyboard(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "key", { key: "ESCAPE", ...bridgeDisplayTarget(target) });
+  return normalizeBridgeSuccess({ ...response, status: "keyboard_close_requested", key: "ESCAPE", keycode: KEYCODES.ESCAPE });
+}
+
+async function androidGrantPermissionDialog(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  const preferred = optionalEnumParam(params, "choice", ["while_using", "once", "allow"] as const, "while_using");
+  const labelGroups: Record<typeof preferred, string[]> = {
+    while_using: ["While using the app", "While using this app", "Allow only while using the app"],
+    once: ["Only this time", "Just once"],
+    allow: ["Allow", "OK"]
+  };
+  const snapshot = await currentAccessibilitySnapshot(deviceId, target);
+  for (const label of labelGroups[preferred]) {
+    const matches = snapshot.nodes.filter((node) => node.source === "accessibility" && (node.text === label || node.contentDesc === label));
+    if (matches.length === 1) {
+      return tapUniqueNode(deviceId, matches, snapshot, true, stableSnapshotOptions(params), "permission");
+    }
+  }
+  return { success: false, status: "permission_dialog_not_found", choice: preferred, currentSnapshot: snapshot };
+}
+
+async function androidOpenRecents(input: unknown): Promise<ToolResult> {
+  return androidKey({ ...optionalObject(input), key: "APP_SWITCH" });
+}
+
+async function androidSwitchRecentApp(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  const first = await androidBridgeRpc(deviceId, "key", { key: "APP_SWITCH", ...bridgeDisplayTarget(target) });
+  await sleep(150);
+  const second = await androidBridgeRpc(deviceId, "key", { key: "APP_SWITCH", ...bridgeDisplayTarget(target) });
+  return normalizeBridgeSuccess({ ...second, firstSuccess: first.success, status: "recent_app_switch_requested", key: "APP_SWITCH" });
+}
+
 async function androidCurrentApp(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
@@ -2690,6 +2848,44 @@ async function androidWaitForText(input: unknown): Promise<ToolResult> {
     };
   });
   return waitResult(result.done, result.elapsedMs, wait, result.data, "text_found", "text_timeout");
+}
+
+async function androidWaitForRefGone(input: unknown): Promise<ToolResult> {
+  const params = expectObject(input);
+  const snapshotId = stringParam(params, "snapshotId");
+  const ref = stringParam(params, "ref");
+  const requestedDeviceId = optionalStringParam(params, "deviceId");
+  const requestedTarget = displayTargetParams(params);
+  const cached = snapshotCache.get(snapshotId);
+  if (!cached) throw new ToolInputError("The requested snapshotId is no longer cached. Call android_get_semantic_screen again.");
+  if (requestedDeviceId && requestedDeviceId !== cached.deviceId) throw new ToolInputError(`snapshotId belongs to device '${cached.deviceId}', not '${requestedDeviceId}'.`);
+  const cachedTarget = cached.sessionId ? { sessionId: cached.sessionId } : { displayId: cached.displayId };
+  if (hasDisplayTarget(requestedTarget)) {
+    const requestedIdentity = requestedTarget.sessionId ?? `display-${requestedTarget.displayId ?? 0}`;
+    const cachedIdentity = cached.sessionId ?? `display-${cached.displayId}`;
+    if (requestedIdentity !== cachedIdentity) throw new ToolInputError(`snapshotId belongs to '${cachedIdentity}', not '${requestedIdentity}'.`);
+  }
+  const original = cached.nodes.find((node) => node.ref === ref);
+  if (!original) throw new ToolInputError(`ref '${ref}' was not found in snapshot '${snapshotId}'.`);
+  if (original.source !== "accessibility") throw new ToolInputError("android_wait_for_ref_gone supports accessibility refs only.");
+  const wait = waitOptions(params);
+  const result = await pollUntil(wait, async () => {
+    const snapshot = await currentAccessibilitySnapshot(cached.deviceId, cachedTarget);
+    if (snapshot.screenSignature === cached.screenSignature) {
+      return { done: false, data: { currentSnapshot: snapshot, matched: nodeRefSummary(snapshot.snapshotId, original) } };
+    }
+    const relocated = relocateAccessibilityNode(original, snapshot.nodes);
+    const gone = !relocated.node && !relocated.candidates;
+    return {
+      done: gone,
+      data: {
+        currentSnapshot: snapshot,
+        ...(relocated.node ? { matched: nodeRefSummary(snapshot.snapshotId, relocated.node) } : {}),
+        ...(relocated.candidates ? { candidates: relocated.candidates } : {})
+      }
+    };
+  });
+  return waitResult(result.done, result.elapsedMs, wait, result.data, "ref_gone", "ref_still_present");
 }
 
 async function androidWaitForScreenChange(input: unknown): Promise<ToolResult> {
@@ -3040,11 +3236,24 @@ const selectorSchema = {
   },
   additionalProperties: false
 };
+const afterActionSchema = {
+  type: "object",
+  properties: {
+    waitForText: { type: "string", minLength: 1 },
+    waitForPackage: { type: "string", minLength: 1 },
+    role: { type: "string", minLength: 1 },
+    fuzzy: { type: "boolean", default: false },
+    timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+    pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+  },
+  additionalProperties: false
+};
 const stableSnapshotProperties = {
   returnSnapshot: { type: "boolean", default: true },
   waitForStable: { type: "boolean", default: true },
   stableTimeoutMs: { type: "integer", minimum: 1, default: DEFAULT_STABLE_TIMEOUT_MS },
-  stablePollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_STABLE_POLL_INTERVAL_MS }
+  stablePollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_STABLE_POLL_INTERVAL_MS },
+  after: afterActionSchema
 };
 const deviceProperties = {
   deviceId: { type: "string", minLength: 1, description: "ADB device serial. Omit only when exactly one authorized device is connected." }
@@ -3054,7 +3263,114 @@ const displayTargetProperties = {
   displayId: { type: "integer", minimum: 0, description: "Android display ID. Omit for the default physical display." }
 };
 
+function sanitizeTraceValue(value: unknown, key = ""): unknown {
+  if (key === "pngBase64" || key === "rawOcr" || key === "rawVision") return "[omitted]";
+  if ((key === "text" || key === "targetText") && typeof value === "string") return `[redacted:${value.length}]`;
+  if (Array.isArray(value)) return value.map((item) => sanitizeTraceValue(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([childKey, child]) => [childKey, sanitizeTraceValue(child, childKey)]));
+  }
+  return value;
+}
+
+async function recordTraceEvent(toolName: string, input: unknown, result: unknown, error: Error | undefined, elapsedMs: number): Promise<void> {
+  const trace = activeTrace;
+  if (!trace || toolName.startsWith("android_trace_")) return;
+  const step = ++trace.step;
+  const baseName = `${String(step).padStart(4, "0")}-${safeFileName(toolName)}`;
+  const event: Record<string, unknown> = {
+    step,
+    timestamp: new Date().toISOString(),
+    tool: toolName,
+    elapsedMs,
+    input: sanitizeTraceValue(input),
+    ...(error ? { error: { name: error.name, message: error.message } } : { result: sanitizeTraceValue(result) })
+  };
+  const imagePath = result && typeof result === "object" && typeof (result as Record<string, unknown>).imagePath === "string"
+    ? (result as Record<string, unknown>).imagePath as string
+    : undefined;
+  if (imagePath) {
+    const traceImage = join(trace.directory, `${baseName}.png`);
+    try {
+      await copyFile(imagePath, traceImage);
+      event.screenshotPath = traceImage;
+    } catch (copyError) {
+      event.screenshotCopyError = (copyError as Error).message;
+    }
+  }
+  await writeFile(join(trace.directory, `${baseName}.json`), `${JSON.stringify(event, null, 2)}\n`, "utf8");
+  await appendFile(join(trace.directory, "events.jsonl"), `${JSON.stringify(event)}\n`, "utf8");
+}
+
+async function androidTraceStart(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  if (activeTrace) throw new ToolInputError(`Trace '${activeTrace.traceId}' is already active.`);
+  const traceId = optionalStringParam(params, "traceId") ?? `trace-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const directory = join(TRACE_ROOT, safeFileName(traceId));
+  await mkdir(directory, { recursive: true });
+  activeTrace = { traceId, directory, startedAt: new Date().toISOString(), step: 0 };
+  await writeFile(join(directory, "trace.json"), `${JSON.stringify({ traceId, startedAt: activeTrace.startedAt, status: "active" }, null, 2)}\n`, "utf8");
+  return { success: true, status: "trace_started", traceId, directory, startedAt: activeTrace.startedAt };
+}
+
+async function androidTraceStop(): Promise<ToolResult> {
+  const trace = activeTrace;
+  if (!trace) return { success: true, status: "trace_not_active" };
+  const stoppedAt = new Date().toISOString();
+  activeTrace = undefined;
+  await writeFile(join(trace.directory, "trace.json"), `${JSON.stringify({ traceId: trace.traceId, startedAt: trace.startedAt, stoppedAt, status: "stopped", stepCount: trace.step }, null, 2)}\n`, "utf8");
+  return { success: true, status: "trace_stopped", traceId: trace.traceId, directory: trace.directory, startedAt: trace.startedAt, stoppedAt, stepCount: trace.step };
+}
+
+async function androidTraceStatus(): Promise<ToolResult> {
+  return activeTrace
+    ? { success: true, status: "trace_active", ...activeTrace }
+    : { success: true, status: "trace_not_active" };
+}
+
+function capabilityGroupForTool(name: string): CapabilityGroup {
+  if (name.startsWith("android_trace_")) return "trace";
+  if (name === "android_ocr_screen") return "ocr";
+  if (["android_current_app", "android_wait_for_package", "android_list_apps", "android_launch_app"].includes(name)) return "apps";
+  if (["android_list_devices", "android_bridge_ping", "android_bridge_exit", "android_probe_virtual_display", "android_list_displays", "android_dump_tree", "android_dump_compact"].includes(name)) return "debug";
+  if (["android_tap", "android_long_press"].includes(name)) return "vision";
+  return "core";
+}
+
+async function androidCapabilities(): Promise<ToolResult> {
+  return {
+    success: true,
+    enabled: ALL_CAPABILITY_GROUPS.filter((group) => enabledCapabilityGroups.has(group)),
+    available: ALL_CAPABILITY_GROUPS,
+    configuredBy: process.env.ANDROID_MCP_CAPABILITIES ? "ANDROID_MCP_CAPABILITIES" : "default_all"
+  };
+}
+
 const tools: ToolDefinition[] = [
+  {
+    name: "android_capabilities",
+    description: "List available and currently enabled MCP capability groups.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidCapabilities
+  },
+  {
+    name: "android_trace_start",
+    description: "Start a local agent-debugging trace that records sanitized tool steps, results, snapshots, and screenshots.",
+    inputSchema: { type: "object", properties: { traceId: { type: "string", minLength: 1 } }, additionalProperties: false },
+    handler: androidTraceStart
+  },
+  {
+    name: "android_trace_stop",
+    description: "Stop the active local trace and return its directory.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidTraceStop
+  },
+  {
+    name: "android_trace_status",
+    description: "Return whether a local trace is active and its current step count.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidTraceStatus
+  },
   {
     name: "android_list_devices",
     description: "List Android devices visible to ADB, including authorization and managed bridge state.",
@@ -3168,6 +3484,24 @@ const tools: ToolDefinition[] = [
       additionalProperties: false
     },
     handler: androidWaitForText
+  },
+  {
+    name: "android_wait_for_ref_gone",
+    description: "Poll until an accessibility ref from a cached snapshot can no longer be found on the same display.",
+    inputSchema: {
+      type: "object",
+      required: ["snapshotId", "ref"],
+      properties: {
+        ...deviceProperties,
+        ...displayTargetProperties,
+        snapshotId: { type: "string", minLength: 1 },
+        ref: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
+        pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
+      },
+      additionalProperties: false
+    },
+    handler: androidWaitForRefGone
   },
   {
     name: "android_wait_for_screen_change",
@@ -3419,7 +3753,8 @@ const tools: ToolDefinition[] = [
         x2: integerSchema,
         y2: integerSchema,
         durationMs: { ...integerSchema, default: 300 },
-        steps: { ...positiveIntegerSchema, description: "Optional UIAutomator swipe steps. Defaults to durationMs / 5." }
+        steps: { ...positiveIntegerSchema, description: "Optional UIAutomator swipe steps. Defaults to durationMs / 5." },
+        after: afterActionSchema
       },
       additionalProperties: false
     },
@@ -3436,7 +3771,8 @@ const tools: ToolDefinition[] = [
         ...displayTargetProperties,
         text: { type: "string", minLength: 1 },
         selector: selectorSchema,
-        pressEnter: { type: "boolean", default: false }
+        pressEnter: { type: "boolean", default: false },
+        after: afterActionSchema
       },
       additionalProperties: false
     },
@@ -3453,7 +3789,8 @@ const tools: ToolDefinition[] = [
         ...displayTargetProperties,
         action: { type: "string", minLength: 1 },
         selector: selectorSchema,
-        text: { type: "string", minLength: 1, description: "Text used by the set_text action." }
+        text: { type: "string", minLength: 1, description: "Text used by the set_text action." },
+        after: afterActionSchema
       },
       additionalProperties: false
     },
@@ -3470,7 +3807,8 @@ const tools: ToolDefinition[] = [
         ...displayTargetProperties,
         x: integerSchema,
         y: integerSchema,
-        durationMs: { ...integerSchema, default: 650 }
+        durationMs: { ...integerSchema, default: 650 },
+        after: afterActionSchema
       },
       additionalProperties: false
     },
@@ -3482,7 +3820,7 @@ const tools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       required: ["key"],
-      properties: { ...deviceProperties, ...displayTargetProperties, key: { type: "string", enum: Object.keys(KEYCODES) } },
+      properties: { ...deviceProperties, ...displayTargetProperties, key: { type: "string", enum: Object.keys(KEYCODES) }, after: afterActionSchema },
       additionalProperties: false
     },
     handler: androidKey
@@ -3490,8 +3828,48 @@ const tools: ToolDefinition[] = [
   {
     name: "android_go_home",
     description: "Send the HOME key event through the persistent on-device UIAutomator bridge.",
-    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
     handler: androidGoHome
+  },
+  {
+    name: "android_open_notifications",
+    description: "Open the notification shade on display 0.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
+    handler: androidOpenNotifications
+  },
+  {
+    name: "android_open_quick_settings",
+    description: "Open Quick Settings on display 0.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
+    handler: androidOpenQuickSettings
+  },
+  {
+    name: "android_close_keyboard",
+    description: "Request that the software keyboard close without navigating Back.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
+    handler: androidCloseKeyboard
+  },
+  {
+    name: "android_grant_permission_dialog",
+    description: "Grant the visible Android runtime-permission dialog using a preferred allow choice.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProperties, ...displayTargetProperties, choice: { type: "string", enum: ["while_using", "once", "allow"], default: "while_using" }, ...stableSnapshotProperties },
+      additionalProperties: false
+    },
+    handler: androidGrantPermissionDialog
+  },
+  {
+    name: "android_open_recents",
+    description: "Open Android's recent-apps overview.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
+    handler: androidOpenRecents
+  },
+  {
+    name: "android_switch_recent_app",
+    description: "Switch to the previously used app by issuing the recents quick-switch gesture.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties, after: afterActionSchema }, additionalProperties: false },
+    handler: androidSwitchRecentApp
   },
   {
     name: "android_list_apps",
@@ -3519,7 +3897,8 @@ const tools: ToolDefinition[] = [
         applicationId: { type: "string", minLength: 1 },
         appName: { type: "string", minLength: 1 },
         allowSubstring: { type: "boolean", default: true },
-        resolveLabels: { type: "boolean", default: true }
+        resolveLabels: { type: "boolean", default: true },
+        after: afterActionSchema
       },
       additionalProperties: false
     },
@@ -3528,6 +3907,13 @@ const tools: ToolDefinition[] = [
 ];
 
 const toolMap = new Map(tools.map((tool) => [tool.name, tool]));
+const actionToolNames = new Set([
+  "android_tap", "android_tap_ref", "android_fill_ref", "android_long_press_ref", "android_perform_action_ref",
+  "android_tap_text", "android_tap_content_desc", "android_click", "android_fill_near_label", "android_swipe",
+  "android_input_text", "android_perform_action", "android_long_press", "android_key", "android_go_home", "android_launch_app",
+  "android_open_notifications", "android_open_quick_settings", "android_close_keyboard", "android_grant_permission_dialog",
+  "android_open_recents", "android_switch_recent_app"
+]);
 
 function sendResponse(id: JsonRpcId | undefined, result: unknown): void {
   if (id === undefined) {
@@ -3564,8 +3950,17 @@ async function handleRequest(request: JsonRpcRequest): Promise<void> {
   }
 
   if (method === "tools/list") {
+    const listParams = optionalObject(request.params);
+    const requested = Array.isArray(listParams.capabilities)
+      ? new Set(listParams.capabilities.filter((value): value is CapabilityGroup => typeof value === "string" && ALL_CAPABILITY_GROUPS.includes(value as CapabilityGroup)))
+      : undefined;
+    const visibleTools = tools.filter((tool) => {
+      if (tool.name === "android_capabilities") return true;
+      const group = capabilityGroupForTool(tool.name);
+      return enabledCapabilityGroups.has(group) && (!requested || requested.has(group));
+    });
     sendResponse(id, {
-      tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }))
+      tools: visibleTools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema, _meta: { "android-ui-mcp/capabilityGroup": capabilityGroupForTool(name) } }))
     });
     return;
   }
@@ -3586,14 +3981,28 @@ async function handleToolCall(id: JsonRpcId | undefined, params: unknown): Promi
     sendError(id, -32602, `Unknown tool: ${name}`);
     return;
   }
+  const group = capabilityGroupForTool(name);
+  if (name !== "android_capabilities" && !enabledCapabilityGroups.has(group)) {
+    sendError(id, -32602, `Tool '${name}' is disabled because capability group '${group}' is not enabled.`);
+    return;
+  }
 
+  const started = performance.now();
   try {
-    const result = await tool.handler(call.arguments);
+    let result = await tool.handler(call.arguments);
+    if (actionToolNames.has(name) && result.success !== false) {
+      const after = await runAfterConditions(call.arguments);
+      if (after) result = { ...result, success: after.success === true, after };
+    }
+    await recordTraceEvent(name, call.arguments, result, undefined, Math.round(performance.now() - started)).catch((traceError) => {
+      process.stderr.write(`[android-ui-mcp] Trace write failed: ${(traceError as Error).message}\n`);
+    });
     sendResponse(id, {
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
     });
   } catch (error) {
     const err = error as Error;
+    await recordTraceEvent(name, call.arguments, undefined, err, Math.round(performance.now() - started)).catch(() => undefined);
     const data =
       error instanceof AdbCommandError || error instanceof AndroidBridgeError || error instanceof AndroidDeviceError ? error.details : undefined;
     sendResponse(id, {
@@ -3638,5 +4047,18 @@ export const __test = {
   invalidateVirtualSessions,
   activeVirtualSessions,
   staleVirtualSessions,
-  snapshotCache
+  snapshotCache,
+  bridgeRpcOnPort,
+  bridgeRpcOnSocket,
+  rankSemanticNodes,
+  mergeSemanticNodes,
+  relocateAccessibilityNode,
+  afterConditions,
+  capabilityGroupForTool,
+  sanitizeTraceValue,
+  ocrCache,
+  androidTraceStart,
+  androidTraceStatus,
+  androidTraceStop,
+  recordTraceEvent
 };

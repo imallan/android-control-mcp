@@ -6,10 +6,13 @@ on-device bridge, exposed over MCP stdio:
 - `android_bridge_ping`: verify that the on-device bridge is reachable
 - `android_bridge_exit`: stop the on-device bridge
 - `android_list_devices`: list ADB devices and managed bridge state
+- `android_capabilities`: report enabled tool capability groups
+- `android_trace_start`, `android_trace_status`, `android_trace_stop`: local sanitized agent-debugging traces
 - `android_create_virtual_display`, `android_list_displays`, `android_destroy_virtual_display`: manage one bridge-owned Android 14+ headless display per device
 - `android_current_app`: return the current foreground Android package
 - `android_wait_for_package`
 - `android_wait_for_text`
+- `android_wait_for_ref_gone`
 - `android_wait_for_screen_change`
 - `android_screenshot`: overwrites one stable temp file by default; pass `retain=true` to keep a unique screenshot
 - `android_ocr_screen`: run local OCR on the current screenshot and return compact OCR nodes
@@ -29,6 +32,8 @@ on-device bridge, exposed over MCP stdio:
 - `android_input_text`
 - `android_key`
 - `android_go_home`
+- `android_open_notifications`, `android_open_quick_settings`, `android_close_keyboard`
+- `android_grant_permission_dialog`, `android_open_recents`, `android_switch_recent_app`
 - `android_list_apps`: list launcher apps through the Android bridge
 - `android_launch_app`: launch by `applicationId`, or by a unique `appName` match
 
@@ -69,6 +74,8 @@ Optional environment variables:
 - `ANDROID_UI_MCP_PORT`: first bridge/adb-forward port, default `27183`
 - `ANDROID_UI_MCP_PORT_BASE`: base port for additional device forwards, default `ANDROID_UI_MCP_PORT` or `27183`
 - `ANDROID_UI_MCP_TIMEOUT_MS`: bridge request timeout, default `15000`
+- `ANDROID_MCP_CAPABILITIES`: optional comma-separated tool groups (`core,ocr,apps,debug,trace,vision`); defaults to all
+- `ANDROID_MCP_TRACE_DIR`: local trace root, default `<OS temp>/android-ui-mcp/traces`
 
 ## MCP Client Configuration
 
@@ -119,6 +126,8 @@ Restart or reload Codex after installation so it discovers the tools.
 - `android_perform_action` and `android_perform_action_ref` accept predefined accessibility action names or custom action labels exposed by the target node.
 - `android_screenshot` and `android_ocr_screen` use direct ADB capture for display 0 and bridge-owned ImageReader capture for virtual displays.
 - `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
+- OCR results use a bounded content-and-parameter LRU and report `ocrCached`.
+- Mutating tools accept `after.waitForText` and/or `after.waitForPackage` postconditions.
 - The Apple Vision engine is the default OCR backend on this MCP.
 - The Tesseract engine requires local `tesseract` on `PATH`.
 - The Apple Vision engine requires macOS. The desktop server compiles `apple-vision-ocr.swift` with `swiftc` into `/tmp/android-ui-mcp/apple-vision-ocr` on first use unless `ANDROID_MCP_APPLE_VISION_OCR_BIN` is set.

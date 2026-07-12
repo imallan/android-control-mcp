@@ -1513,6 +1513,7 @@ class BridgeTest : UiAutomatorTestCase() {
         "HOME" -> KeyEvent.KEYCODE_HOME
         "ENTER" -> KeyEvent.KEYCODE_ENTER
         "APP_SWITCH" -> KeyEvent.KEYCODE_APP_SWITCH
+        "ESCAPE" -> KeyEvent.KEYCODE_ESCAPE
         "DEL" -> KeyEvent.KEYCODE_DEL
         else -> throw IllegalArgumentException("unknown key: $key")
       }
