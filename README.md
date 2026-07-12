@@ -28,6 +28,11 @@ Requirements:
 - `adb` available on `PATH`
 - `android-server/build/android-ui-server.jar` built before the first bridge-backed tool call
 
+Android 14+ devices can run display-scoped headless sessions. Create a session with
+`android_create_virtual_display`, pass its `sessionId` to launch, observation, wait,
+and input tools, then release it with `android_destroy_virtual_display`. The default
+display remains display `0` when no target is supplied.
+
 The MCP server has no npm dependencies; it runs directly on Node 24's TypeScript support. It can start with no Android device connected. When a device-backed tool is called, the server discovers connected devices and starts the on-device UIAutomator bridge automatically.
 
 ## Install in Codex

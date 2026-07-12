@@ -6,6 +6,8 @@
   "description": "MCP server for Android UI automation through a persistent on-device bridge.",
   "scripts": {
     "build": "node --check src/server.ts",
+    "test": "node --test test/*.test.mjs",
+    "test:headless": "node test/headless-virtual-display.e2e.mjs",
     "start": "node src/server.ts",
     "dev": "node src/server.ts",
     "typecheck": "node --check src/server.ts"

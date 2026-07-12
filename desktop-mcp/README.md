@@ -6,6 +6,7 @@ on-device bridge, exposed over MCP stdio:
 - `android_bridge_ping`: verify that the on-device bridge is reachable
 - `android_bridge_exit`: stop the on-device bridge
 - `android_list_devices`: list ADB devices and managed bridge state
+- `android_create_virtual_display`, `android_list_displays`, `android_destroy_virtual_display`: manage one bridge-owned Android 14+ headless display per device
 - `android_current_app`: return the current foreground Android package
 - `android_wait_for_package`
 - `android_wait_for_text`
@@ -30,6 +31,11 @@ on-device bridge, exposed over MCP stdio:
 - `android_go_home`
 - `android_list_apps`: list launcher apps through the Android bridge
 - `android_launch_app`: launch by `applicationId`, or by a unique `appName` match
+
+Observation, wait, launch, coordinate, locator, and ref tools accept either
+`sessionId` or `displayId`. Supplying both is rejected. A virtual display session
+binds screenshot, accessibility, OCR/vision, snapshots, refs, and injected input to
+the same display. Snapshot refs cannot be reused across displays.
 
 ## Requirements
 
@@ -111,7 +117,7 @@ Restart or reload Codex after installation so it discovers the tools.
 - Bridge-backed tools start the on-device bridge automatically for the selected `deviceId`; if multiple authorized devices are connected and no default is set, pass `deviceId`.
 - Coordinate, ref, and locator action tools default to returning a post-action snapshot after waiting up to 1500 ms for strict or actionable accessibility stability.
 - `android_perform_action` and `android_perform_action_ref` accept predefined accessibility action names or custom action labels exposed by the target node.
-- `android_screenshot` and `android_ocr_screen` use direct ADB screenshot capture because the Android bridge does not yet expose screenshot capture.
+- `android_screenshot` and `android_ocr_screen` use direct ADB capture for display 0 and bridge-owned ImageReader capture for virtual displays.
 - `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
 - The Apple Vision engine is the default OCR backend on this MCP.
 - The Tesseract engine requires local `tesseract` on `PATH`.
@@ -126,3 +132,5 @@ Restart or reload Codex after installation so it discovers the tools.
 - `FLAG_SECURE` apps can return black screenshots.
 - WebView, OpenGL, and game screens may expose little or no accessibility tree.
 - Apple Vision is macOS-only and its supported OCR languages depend on the installed system.
+- Headless sessions require Android 14+ and hidden Android APIs that an OEM may restrict.
+- The first implementation owns one virtual display per device; creating another invalidates the previous session with `virtual_display_recreated`.

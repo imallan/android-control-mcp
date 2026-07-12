@@ -12,6 +12,12 @@ adb forward tcp:27183 localabstract:android-ui-mcp
 
 The Android bridge is implemented in Kotlin in `android-server/src/com/example/androiduiserver/BridgeTest.kt`.
 
+Headless virtual-display phases 0–5 are implemented. On Android 14+, the bridge can
+own one focusable/touch-capable virtual display, launch an app onto it, capture its
+ImageReader surface, filter accessibility windows by display, inject display-tagged
+touch/key events, and cleanly invalidate session-bound snapshots on destroy,
+replacement, or bridge restart.
+
 ## Exposed MCP Tools
 
 Bridge-backed tools:
@@ -421,7 +427,8 @@ To bypass stability waiting for a tool call:
 
 ## Known Limitations
 
-- `android_screenshot` still uses direct ADB because screenshot capture is not implemented in the Android bridge.
+- Display 0 screenshots use direct ADB; MCP-owned virtual displays use bridge-side ImageReader capture.
+- Headless virtual displays require Android 14+; only one MCP-owned display per device is supported in the first implementation.
 - Multi-device selection is per call through optional `deviceId`; `ANDROID_SERIAL` remains a default when `deviceId` is omitted.
 - App-name matching is best effort. `applicationId` launch is deterministic.
 - `uiautomator` exposes the accessibility tree, not the full rendered view tree.

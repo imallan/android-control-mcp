@@ -28,6 +28,8 @@ type OcrMode = "auto" | "force" | "off";
 
 type OcrEngine = "tesseract" | "apple-vision";
 
+type DisplayTarget = { sessionId?: string; displayId?: number };
+
 type SemanticNode = {
   id: string;
   ref?: string;
@@ -49,6 +51,8 @@ type SemanticNode = {
 
 type SemanticSnapshot = {
   deviceId: string;
+  displayId: number;
+  sessionId?: string;
   snapshotId: string;
   screenSignature: string;
   actionableSignature: string;
@@ -91,6 +95,8 @@ type ScreenshotResult = ToolResult & {
   width: number;
   height: number;
   retained: boolean;
+  displayId?: number;
+  sessionId?: string;
 };
 
 type OcrWord = {
@@ -181,8 +187,31 @@ const DEFAULT_WAIT_TIMEOUT_MS = 5_000;
 const DEFAULT_WAIT_POLL_INTERVAL_MS = 300;
 const DEFAULT_STABLE_TIMEOUT_MS = 1_500;
 const DEFAULT_STABLE_POLL_INTERVAL_MS = 150;
+const DEFAULT_VIRTUAL_DISPLAY_WIDTH = 1280;
+const DEFAULT_VIRTUAL_DISPLAY_HEIGHT = 960;
+const DEFAULT_VIRTUAL_DISPLAY_DPI = 160;
+const DEFAULT_VIRTUAL_FRAME_TIMEOUT_MS = 2_000;
 
 const snapshotCache = new Map<string, SnapshotCacheEntry>();
+const activeVirtualSessions = new Map<string, string>();
+const staleVirtualSessions = new Map<string, "bridge_restarted" | "virtual_display_recreated" | "virtual_display_not_found">();
+
+function invalidateSnapshots(deviceId: string, sessionId?: string): void {
+  for (const [snapshotId, snapshot] of snapshotCache) {
+    if (snapshot.deviceId === deviceId && (sessionId === undefined || snapshot.sessionId === sessionId)) {
+      snapshotCache.delete(snapshotId);
+    }
+  }
+}
+
+function invalidateVirtualSessions(deviceId: string, reason: "bridge_restarted" | "virtual_display_recreated"): void {
+  for (const [sessionId, ownerDeviceId] of activeVirtualSessions) {
+    if (ownerDeviceId === deviceId) {
+      activeVirtualSessions.delete(sessionId);
+      staleVirtualSessions.set(sessionId, reason);
+    }
+  }
+}
 
 const KEYCODES: Record<string, string> = {
   BACK: "KEYCODE_BACK",
@@ -315,7 +344,7 @@ class DeviceManager {
       return bridge;
     }
     if (!bridge.startPromise) {
-      bridge.startPromise = this.startBridge(bridge).finally(() => {
+      bridge.startPromise = this.startBridgeWithRetry(bridge).finally(() => {
         bridge.startPromise = undefined;
       });
     }
@@ -356,6 +385,8 @@ class DeviceManager {
     bridge.process?.kill();
     bridge.process = undefined;
     bridge.state = "stopped";
+    invalidateSnapshots(deviceId);
+    invalidateVirtualSessions(deviceId, "bridge_restarted");
   }
 
   stopAll(): void {
@@ -396,7 +427,22 @@ class DeviceManager {
     return port;
   }
 
+  private async startBridgeWithRetry(bridge: BridgeContext): Promise<void> {
+    try {
+      await this.startBridge(bridge);
+    } catch (error) {
+      const message = (error as Error).message;
+      if (!message.includes("Error while registering UiTestAutomationService")) {
+        throw error;
+      }
+      await sleep(1_000);
+      await this.startBridge(bridge);
+    }
+  }
+
   private async startBridge(bridge: BridgeContext): Promise<void> {
+    invalidateSnapshots(bridge.deviceId);
+    invalidateVirtualSessions(bridge.deviceId, "bridge_restarted");
     bridge.state = "starting";
     bridge.lastError = undefined;
     try {
@@ -435,9 +481,13 @@ class DeviceManager {
       bridge.process.on("error", (error) => {
         bridge.state = "failed";
         bridge.lastError = error.message;
+        invalidateSnapshots(bridge.deviceId);
+        invalidateVirtualSessions(bridge.deviceId, "bridge_restarted");
       });
       bridge.process.on("exit", (code, signal) => {
         bridge.state = code === 0 ? "stopped" : "failed";
+        invalidateSnapshots(bridge.deviceId);
+        invalidateVirtualSessions(bridge.deviceId, "bridge_restarted");
         if (code !== 0 || signal) {
           bridge.lastError = bridgeProcessMessage(bridge, `Bridge process exited with code ${code ?? "null"} signal ${signal ?? "null"}.`);
         }
@@ -577,7 +627,26 @@ async function androidBridgeRpc(
   method: string,
   params: Record<string, string | number | boolean> = {}
 ): Promise<Record<string, unknown>> {
+  const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+  const staleReason = sessionId ? staleVirtualSessions.get(sessionId) : undefined;
+  if (sessionId && staleReason) {
+    throw new AndroidBridgeError(`${staleReason}: virtual display session '${sessionId}' is no longer valid.`, {
+      status: staleReason,
+      deviceId,
+      sessionId,
+      method
+    });
+  }
   const bridge = await deviceManager.ensureBridge(deviceId);
+  const staleReasonAfterStart = sessionId ? staleVirtualSessions.get(sessionId) : undefined;
+  if (sessionId && staleReasonAfterStart) {
+    throw new AndroidBridgeError(`${staleReasonAfterStart}: virtual display session '${sessionId}' is no longer valid.`, {
+      status: staleReasonAfterStart,
+      deviceId,
+      sessionId,
+      method
+    });
+  }
   return deviceManager.runOnDevice(deviceId, () => bridgeRpcOnPort(deviceId, bridge.port, method, params));
 }
 
@@ -881,26 +950,84 @@ function parsePngSize(png: Buffer): { width: number; height: number } {
   };
 }
 
+function displayTargetParams(input: Record<string, unknown>): DisplayTarget {
+  const sessionId = optionalStringParam(input, "sessionId");
+  const displayIdValue = input.displayId;
+  const displayId =
+    displayIdValue === undefined || displayIdValue === null
+      ? undefined
+      : (() => {
+          if (!Number.isInteger(displayIdValue) || (displayIdValue as number) < 0) {
+            throw new ToolInputError("displayId must be a non-negative integer when provided.");
+          }
+          return displayIdValue as number;
+        })();
+  if (sessionId !== undefined && displayId !== undefined) {
+    throw new ToolInputError("Provide only one of sessionId or displayId.");
+  }
+  return {
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(displayId !== undefined ? { displayId } : {})
+  };
+}
+
+function hasDisplayTarget(target: { sessionId?: string; displayId?: number }): boolean {
+  return target.sessionId !== undefined || target.displayId !== undefined;
+}
+
+function bridgeDisplayTarget(target: DisplayTarget): Record<string, string | number> {
+  return {
+    ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+    ...(target.displayId !== undefined ? { displayId: target.displayId } : {})
+  };
+}
+
 async function androidScreenshot(input: unknown): Promise<ScreenshotResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
   const retain = optionalBooleanParam(params, "retain", false);
-  const png = await adbBuffer(["exec-out", "screencap", "-p"], SCREENSHOT_TIMEOUT_MS, deviceId);
+  const target = displayTargetParams(params);
+  const timeoutMs = optionalIntegerParam(params, "timeoutMs", DEFAULT_VIRTUAL_FRAME_TIMEOUT_MS);
+  let png: Buffer;
+  let displayId: number | undefined;
+  let sessionId: string | undefined;
+  if (hasDisplayTarget(target)) {
+    if (target.displayId === 0) {
+      throw new ToolInputError("displayId 0 is the default display; omit displayId to use the default screenshot path.");
+    }
+    const response = await androidBridgeRpc(deviceId, "captureFrame", {
+      ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+      ...(target.displayId !== undefined ? { displayId: target.displayId } : {}),
+      timeoutMs
+    });
+    const pngBase64 = response.pngBase64;
+    if (typeof pngBase64 !== "string" || pngBase64.length === 0) {
+      throw new AndroidBridgeError("Android bridge captureFrame response did not include pngBase64.", { response });
+    }
+    png = Buffer.from(pngBase64, "base64");
+    displayId = typeof response.displayId === "number" ? response.displayId : target.displayId;
+    sessionId = typeof response.sessionId === "string" ? response.sessionId : target.sessionId;
+  } else {
+    png = await adbBuffer(["exec-out", "screencap", "-p"], SCREENSHOT_TIMEOUT_MS, deviceId);
+    displayId = 0;
+  }
   const { width, height } = parsePngSize(png);
-  const dir = retain ? await mkdtemp(join(tmpdir(), "android-ui-mcp-")) : join(tmpdir(), "android-ui-mcp", safeFileName(deviceId));
+  const targetSuffix = sessionId ?? (displayId !== undefined ? `display-${displayId}` : "display-0");
+  const dir = retain ? await mkdtemp(join(tmpdir(), "android-ui-mcp-")) : join(tmpdir(), "android-ui-mcp", safeFileName(deviceId), safeFileName(targetSuffix));
   if (!retain) {
     await mkdir(dir, { recursive: true });
   }
   const imagePath = join(dir, "current-screen.png");
   await writeFile(imagePath, png);
-  return { deviceId, imagePath, width, height, retained: retain };
+  return { deviceId, imagePath, width, height, retained: retain, ...(displayId !== undefined ? { displayId } : {}), ...(sessionId ? { sessionId } : {}) };
 }
 
 async function androidOcrScreen(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
   const options = ocrOptions(params);
-  const screenshot = await androidScreenshot({ retain: options.retain, deviceId });
+  const target = displayTargetParams(params);
+  const screenshot = await androidScreenshot({ retain: options.retain, deviceId, ...target });
   const ocr = await runOcr(screenshot, options);
   return {
     ...screenshot,
@@ -919,6 +1046,7 @@ async function androidOcrScreen(input: unknown): Promise<ToolResult> {
 async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
   const options = ocrOptions(params);
   const ocrMode = optionalEnumParam(params, "ocrMode", ["auto", "force", "off"] as const, "auto");
   const visionMode = optionalEnumParam(params, "visionMode", ["auto", "force", "off"] as const, "auto");
@@ -926,16 +1054,19 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const includeRawTree = optionalBooleanParam(params, "includeRawTree", false);
   const includeRawVision = optionalBooleanParam(params, "includeRawVision", false);
 
-  const [screenshot, compact] = await Promise.all([androidScreenshot({ retain: options.retain, deviceId }), androidDumpCompact(deviceId)]);
+  const compact = await androidDumpCompact(deviceId, target);
   const accessibilityNodes = compactNodes(compact);
   const tree = assessTreeUsability(compact, accessibilityNodes);
   const shouldRunOcr = ocrMode === "force" || (ocrMode === "auto" && !tree.usable);
   const shouldRunVision = visionMode === "force" || (visionMode === "auto" && !tree.usable && shouldRunOcr);
+  const screenshot = includeScreenshot || shouldRunOcr || shouldRunVision
+    ? await androidScreenshot({ retain: options.retain, deviceId, ...target })
+    : undefined;
 
   // Run OCR and vision detection in parallel when both are needed
   const [ocr, vision] = await Promise.all([
-    shouldRunOcr ? runOcr(screenshot, options) : Promise.resolve(undefined),
-    shouldRunVision ? runVisionDetect(screenshot.imagePath, { minSize: 28, maxSize: 320 }).catch((err: Error): undefined => {
+    shouldRunOcr && screenshot ? runOcr(screenshot, options) : Promise.resolve(undefined),
+    shouldRunVision && screenshot ? runVisionDetect(screenshot.imagePath, { minSize: 28, maxSize: 320 }).catch((err: Error): undefined => {
       process.stderr.write(`[android-ui-mcp] Vision detect failed (non-fatal): ${err.message}\n`);
       return undefined;
     }) : Promise.resolve(undefined)
@@ -946,14 +1077,16 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   rememberSnapshot(snapshot);
 
   return {
-    ...(includeScreenshot ? screenshot : {}),
+    ...(includeScreenshot && screenshot ? screenshot : {}),
     deviceId,
+    displayId: snapshot.displayId,
+    ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}),
     snapshotId: snapshot.snapshotId,
     screenSignature: snapshot.screenSignature,
     actionableSignature: snapshot.actionableSignature,
     packageName: compact.packageName,
-    width: includeScreenshot ? screenshot.width : compact.width,
-    height: includeScreenshot ? screenshot.height : compact.height,
+    width: includeScreenshot && screenshot ? screenshot.width : compact.width,
+    height: includeScreenshot && screenshot ? screenshot.height : compact.height,
     ocrMode,
     ocrUsed: shouldRunOcr,
     ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
@@ -1532,11 +1665,15 @@ function sourceRank(source: SemanticNode["source"]): number {
 }
 
 function createSemanticSnapshot(deviceId: string, compact: Record<string, unknown>, nodes: SemanticNode[]): SemanticSnapshot {
-  const screenSignature = createScreenSignature(compact, nodes);
-  const actionableSignature = createActionableSignature(compact, nodes);
+  // Signatures must not depend on the caller's maxNodes/OCR/vision options.
+  const signatureNodes = rankSemanticNodes(compactNodes(compact));
+  const screenSignature = createScreenSignature(compact, signatureNodes);
+  const actionableSignature = createActionableSignature(compact, signatureNodes);
   return {
     deviceId,
-    snapshotId: createSnapshotId(deviceId, screenSignature),
+    displayId: typeof compact.displayId === "number" ? compact.displayId : 0,
+    ...(typeof compact.sessionId === "string" ? { sessionId: compact.sessionId } : {}),
+    snapshotId: createSnapshotId(deviceId, typeof compact.sessionId === "string" ? compact.sessionId : `display-${typeof compact.displayId === "number" ? compact.displayId : 0}`, screenSignature),
     screenSignature,
     actionableSignature,
     packageName: typeof compact.packageName === "string" ? compact.packageName : undefined,
@@ -1558,8 +1695,8 @@ function rememberSnapshot(snapshot: SemanticSnapshot): void {
   }
 }
 
-function currentAccessibilitySnapshot(deviceId: string): Promise<SemanticSnapshot> {
-  return androidDumpCompact(deviceId).then((compact) => {
+function currentAccessibilitySnapshot(deviceId: string, target: DisplayTarget = {}): Promise<SemanticSnapshot> {
+  return androidDumpCompact(deviceId, target).then((compact) => {
     const nodes = mergeSemanticNodes(compactNodes(compact), [], [], 80);
     const snapshot = createSemanticSnapshot(deviceId, compact, nodes);
     rememberSnapshot(snapshot);
@@ -1634,9 +1771,10 @@ function coarseBounds(bounds: Bounds, grid = 32): Bounds {
   return bounds.map((value) => Math.round(value / grid) * grid) as Bounds;
 }
 
-function createSnapshotId(deviceId: string, screenSignature: string): string {
+function createSnapshotId(deviceId: string, displayIdentity: string, screenSignature: string): string {
   const deviceHash = createHash("sha256").update(deviceId).digest("hex").slice(0, 8);
-  return `screen:${deviceHash}:${Date.now()}:${screenSignature.slice(0, 10)}`;
+  const displayHash = createHash("sha256").update(displayIdentity).digest("hex").slice(0, 8);
+  return `screen:${deviceHash}:${displayHash}:${Date.now()}:${screenSignature.slice(0, 10)}`;
 }
 
 function relocateAccessibilityNode(
@@ -1645,6 +1783,13 @@ function relocateAccessibilityNode(
 ): { node?: SemanticNode; status: "stale_ref_not_found" | "stale_ref_ambiguous"; message: string; candidates?: Record<string, unknown>[] } {
   const candidates = currentNodes.filter((node) => node.source === "accessibility");
   const strategies: Array<{ name: string; matches: SemanticNode[] }> = [
+    {
+      name: "resourceId_class",
+      matches:
+        original.resourceId && original.className
+          ? candidates.filter((node) => node.resourceId === original.resourceId && node.className === original.className)
+          : []
+    },
     {
       name: "resourceId_role",
       matches:
@@ -1727,7 +1872,7 @@ function nodeRefSummary(snapshotId: string | undefined, node: SemanticNode): Rec
   };
 }
 
-async function resolveAccessibilityRef(snapshotId: string, ref: string, requestedDeviceId?: string): Promise<ResolvedRef> {
+async function resolveAccessibilityRef(snapshotId: string, ref: string, requestedDeviceId?: string, requestedTarget: DisplayTarget = {}): Promise<ResolvedRef> {
   const cached = snapshotCache.get(snapshotId);
   if (!cached) {
     return {
@@ -1747,6 +1892,13 @@ async function resolveAccessibilityRef(snapshotId: string, ref: string, requeste
       ref,
       cached
     };
+  }
+  if (hasDisplayTarget(requestedTarget)) {
+    const requestedIdentity = requestedTarget.sessionId ?? `display-${requestedTarget.displayId ?? 0}`;
+    const cachedIdentity = cached.sessionId ?? `display-${cached.displayId}`;
+    if (requestedIdentity !== cachedIdentity) {
+      return { ok: false, status: "ref_not_found", message: `The requested snapshot belongs to '${cachedIdentity}', not '${requestedIdentity}'.`, snapshotId, ref, cached };
+    }
   }
 
   const originalNode = cached.nodes.find((node) => node.ref === ref);
@@ -1773,7 +1925,7 @@ async function resolveAccessibilityRef(snapshotId: string, ref: string, requeste
     };
   }
 
-  const current = await currentAccessibilitySnapshot(cached.deviceId);
+  const current = await currentAccessibilitySnapshot(cached.deviceId, cached.sessionId ? { sessionId: cached.sessionId } : { displayId: cached.displayId });
   if (current.screenSignature === cached.screenSignature) {
     return { ok: true, status: "fresh", cached, originalNode, current, targetNode: originalNode };
   }
@@ -1826,22 +1978,24 @@ function boundsToSelector(bounds: Bounds): string {
   return `[${bounds[0]},${bounds[1]}][${bounds[2]},${bounds[3]}]`;
 }
 
-async function inputTextIntoNode(deviceId: string, node: SemanticNode, text: string, pressEnter: boolean): Promise<ToolResult> {
+async function inputTextIntoNode(deviceId: string, node: SemanticNode, text: string, pressEnter: boolean, target: DisplayTarget = {}): Promise<ToolResult> {
   const response = await androidBridgeRpc(deviceId, "inputText", {
     text,
+    ...bridgeDisplayTarget(target),
     ...flattenSelector(selectorForNode(node))
   });
   const result = normalizeBridgeSuccess(response);
   if (pressEnter) {
-    await androidBridgeRpc(deviceId, "key", { key: "ENTER" });
+    await androidBridgeRpc(deviceId, "key", { key: "ENTER", ...bridgeDisplayTarget(target) });
   }
   return result;
 }
 
-async function performActionOnNode(deviceId: string, node: SemanticNode, action: string, text?: string): Promise<ToolResult> {
+async function performActionOnNode(deviceId: string, node: SemanticNode, action: string, text: string | undefined, target: DisplayTarget = {}): Promise<ToolResult> {
   const response = await androidBridgeRpc(deviceId, "performAction", {
     action,
     ...(text !== undefined ? { text } : {}),
+    ...bridgeDisplayTarget(target),
     ...flattenSelector(selectorForNode(node))
   });
   return normalizeBridgeSuccess(response);
@@ -1924,8 +2078,9 @@ async function tapUniqueNode(
   }
   const node = matches[0];
   const [x, y] = node.center;
-  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc(deviceId, "tap", { x, y }));
-  const snapshotContext = await postActionSnapshot({ deviceId, returnSnapshot, ...stableOptions });
+  const target = snapshot.sessionId ? { sessionId: snapshot.sessionId } : { displayId: snapshot.displayId };
+  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc(deviceId, "tap", { x, y, ...bridgeDisplayTarget(target) }));
+  const snapshotContext = await postActionSnapshot({ deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...tapResult,
     status: "matched",
@@ -2001,6 +2156,7 @@ function stableSnapshotOptions(input: Record<string, unknown>): { waitForStable:
 
 async function postActionSnapshot(input: {
   deviceId: string;
+  target?: DisplayTarget;
   returnSnapshot: boolean;
   waitForStable: boolean;
   stableTimeoutMs: number;
@@ -2011,7 +2167,7 @@ async function postActionSnapshot(input: {
   }
   if (!input.waitForStable) {
     return {
-      currentSnapshot: await currentAccessibilitySnapshot(input.deviceId),
+      currentSnapshot: await currentAccessibilitySnapshot(input.deviceId, input.target),
       snapshotStable: false,
       stability: "not_requested",
       snapshotWaitElapsedMs: 0
@@ -2019,6 +2175,7 @@ async function postActionSnapshot(input: {
   }
   const stable = await waitForStableSnapshot({
     deviceId: input.deviceId,
+    target: input.target,
     timeoutMs: input.stableTimeoutMs,
     pollIntervalMs: input.stablePollIntervalMs
   });
@@ -2032,14 +2189,15 @@ async function postActionSnapshot(input: {
 
 async function waitForStableSnapshot(options: {
   deviceId: string;
+  target?: DisplayTarget;
   timeoutMs: number;
   pollIntervalMs: number;
 }): Promise<{ snapshot: SemanticSnapshot; stability: "strict" | "actionable" | "timeout"; elapsedMs: number }> {
   const start = performance.now();
-  let previous = await currentAccessibilitySnapshot(options.deviceId);
+  let previous = await currentAccessibilitySnapshot(options.deviceId, options.target);
   await sleep(options.pollIntervalMs);
   while (performance.now() - start <= options.timeoutMs) {
-    const current = await currentAccessibilitySnapshot(options.deviceId);
+    const current = await currentAccessibilitySnapshot(options.deviceId, options.target);
     const elapsedMs = Math.round(performance.now() - start);
     if (current.screenSignature === previous.screenSignature) {
       return { snapshot: current, stability: "strict", elapsedMs };
@@ -2133,7 +2291,8 @@ function boundsOverlapRatio(left: Bounds, right: Bounds): number {
 async function androidDumpTree(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
-  const response = await androidBridgeRpc(deviceId, "dumpXml");
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "dumpXml", bridgeDisplayTarget(target));
   const xml = response.xml;
   if (typeof xml !== "string") {
     throw new AndroidBridgeError("Android bridge dumpXml response did not include XML.", { response });
@@ -2147,11 +2306,11 @@ async function androidDumpTree(input: unknown): Promise<ToolResult> {
 async function androidDumpCompactForInput(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
-  return androidDumpCompact(deviceId);
+  return androidDumpCompact(deviceId, displayTargetParams(params));
 }
 
-async function androidDumpCompact(deviceId: string): Promise<ToolResult> {
-  return androidBridgeRpc(deviceId, "dumpCompact");
+async function androidDumpCompact(deviceId: string, target: DisplayTarget = {}): Promise<ToolResult> {
+  return androidBridgeRpc(deviceId, "dumpCompact", bridgeDisplayTarget(target));
 }
 
 async function androidTap(input: unknown): Promise<ToolResult> {
@@ -2161,9 +2320,10 @@ async function androidTap(input: unknown): Promise<ToolResult> {
   const y = numberParam(params, "y");
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const response = await androidBridgeRpc(deviceId, "tap", { x, y });
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "tap", { x, y, ...bridgeDisplayTarget(target) });
   const tapResult = normalizeBridgeSuccess(response);
-  const snapshotContext = await postActionSnapshot({ deviceId, returnSnapshot, ...stableOptions });
+  const snapshotContext = await postActionSnapshot({ deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...tapResult,
     ...snapshotContext
@@ -2177,14 +2337,15 @@ async function androidTapRef(input: unknown): Promise<ToolResult> {
   const requestedDeviceId = optionalStringParam(params, "deviceId");
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId, displayTargetParams(params));
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
   }
 
   const [x, y] = resolved.targetNode.center;
-  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc(resolved.cached.deviceId, "tap", { x, y }));
-  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, returnSnapshot, ...stableOptions });
+  const target = resolved.cached.sessionId ? { sessionId: resolved.cached.sessionId } : { displayId: resolved.cached.displayId };
+  const tapResult = normalizeBridgeSuccess(await androidBridgeRpc(resolved.cached.deviceId, "tap", { x, y, ...bridgeDisplayTarget(target) }));
+  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...tapResult,
     status: resolved.status,
@@ -2204,7 +2365,7 @@ async function androidFillRef(input: unknown): Promise<ToolResult> {
   const pressEnter = optionalBooleanParam(params, "pressEnter", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId, displayTargetParams(params));
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
   }
@@ -2219,8 +2380,9 @@ async function androidFillRef(input: unknown): Promise<ToolResult> {
     };
   }
 
-  const result = await inputTextIntoNode(resolved.cached.deviceId, resolved.targetNode, text, pressEnter);
-  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, returnSnapshot, ...stableOptions });
+  const target = resolved.cached.sessionId ? { sessionId: resolved.cached.sessionId } : { displayId: resolved.cached.displayId };
+  const result = await inputTextIntoNode(resolved.cached.deviceId, resolved.targetNode, text, pressEnter, target);
+  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...result,
     status: resolved.status,
@@ -2239,15 +2401,16 @@ async function androidLongPressRef(input: unknown): Promise<ToolResult> {
   const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId, displayTargetParams(params));
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
   }
 
   const [x, y] = resolved.targetNode.center;
   const steps = Math.max(1, Math.round(durationMs / 5));
-  const longPressResult = normalizeBridgeSuccess(await androidBridgeRpc(resolved.cached.deviceId, "longPress", { x, y, steps }));
-  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, returnSnapshot, ...stableOptions });
+  const target = resolved.cached.sessionId ? { sessionId: resolved.cached.sessionId } : { displayId: resolved.cached.displayId };
+  const longPressResult = normalizeBridgeSuccess(await androidBridgeRpc(resolved.cached.deviceId, "longPress", { x, y, steps, ...bridgeDisplayTarget(target) }));
+  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...longPressResult,
     status: resolved.status,
@@ -2267,13 +2430,14 @@ async function androidPerformActionRef(input: unknown): Promise<ToolResult> {
   const text = optionalStringParam(params, "text");
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId);
+  const resolved = await resolveAccessibilityRef(snapshotId, ref, requestedDeviceId, displayTargetParams(params));
   if (!resolved.ok) {
     return refFailureResult(resolved, returnSnapshot);
   }
 
-  const actionResult = await performActionOnNode(resolved.cached.deviceId, resolved.targetNode, action, text);
-  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, returnSnapshot, ...stableOptions });
+  const target = resolved.cached.sessionId ? { sessionId: resolved.cached.sessionId } : { displayId: resolved.cached.displayId };
+  const actionResult = await performActionOnNode(resolved.cached.deviceId, resolved.targetNode, action, text, target);
+  const snapshotContext = await postActionSnapshot({ deviceId: resolved.cached.deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...actionResult,
     status: resolved.status,
@@ -2292,7 +2456,8 @@ async function androidTapText(input: unknown): Promise<ToolResult> {
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const snapshot = await currentAccessibilitySnapshot(deviceId);
+  const target = displayTargetParams(params);
+  const snapshot = await currentAccessibilitySnapshot(deviceId, target);
   return tapUniqueNode(deviceId, findNodesByLocator(snapshot.nodes, { text, role, fuzzy }), snapshot, returnSnapshot, stableOptions, "text");
 }
 
@@ -2304,7 +2469,8 @@ async function androidTapContentDesc(input: unknown): Promise<ToolResult> {
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const snapshot = await currentAccessibilitySnapshot(deviceId);
+  const target = displayTargetParams(params);
+  const snapshot = await currentAccessibilitySnapshot(deviceId, target);
   return tapUniqueNode(
     deviceId,
     findNodesByLocator(snapshot.nodes, { contentDesc, role, fuzzy }),
@@ -2321,7 +2487,8 @@ async function androidClick(input: unknown): Promise<ToolResult> {
   const locator = locatorFromParams(params);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const snapshot = await currentAccessibilitySnapshot(deviceId);
+  const target = displayTargetParams(params);
+  const snapshot = await currentAccessibilitySnapshot(deviceId, target);
   return tapUniqueNode(deviceId, findNodesByLocator(snapshot.nodes, locator), snapshot, returnSnapshot, stableOptions, "locator");
 }
 
@@ -2334,7 +2501,8 @@ async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
   const pressEnter = optionalBooleanParam(params, "pressEnter", false);
   const returnSnapshot = optionalBooleanParam(params, "returnSnapshot", true);
   const stableOptions = stableSnapshotOptions(params);
-  const snapshot = await currentAccessibilitySnapshot(deviceId);
+  const target = displayTargetParams(params);
+  const snapshot = await currentAccessibilitySnapshot(deviceId, target);
   const labels = findLabelNodes(snapshot.nodes, label, fuzzy);
   if (labels.length === 0) {
     return noLocatorMatch("label_not_found", "No accessibility label matched.", snapshot, returnSnapshot);
@@ -2363,8 +2531,8 @@ async function androidFillNearLabel(input: unknown): Promise<ToolResult> {
     );
   }
 
-  const result = await inputTextIntoNode(deviceId, best.node, text, pressEnter);
-  const snapshotContext = await postActionSnapshot({ deviceId, returnSnapshot, ...stableOptions });
+  const result = await inputTextIntoNode(deviceId, best.node, text, pressEnter, target);
+  const snapshotContext = await postActionSnapshot({ deviceId, target, returnSnapshot, ...stableOptions });
   return {
     ...result,
     status: "filled",
@@ -2384,7 +2552,8 @@ async function androidSwipe(input: unknown): Promise<ToolResult> {
   const y2 = numberParam(params, "y2");
   const durationMs = params.durationMs === undefined ? 300 : numberParam(params, "durationMs");
   const steps = params.steps === undefined ? Math.max(1, Math.round(durationMs / 5)) : positiveNumberParam(params, "steps");
-  const response = await androidBridgeRpc(deviceId, "swipe", { x1, y1, x2, y2, steps });
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "swipe", { x1, y1, x2, y2, steps, ...bridgeDisplayTarget(target) });
   return normalizeBridgeSuccess({ ...response, steps });
 }
 
@@ -2394,23 +2563,25 @@ async function androidInputText(input: unknown): Promise<ToolResult> {
   const text = stringParam(params, "text");
   const selector = optionalSelectorParam(params, "selector");
   const pressEnter = optionalBooleanParam(params, "pressEnter", false);
+  const target = displayTargetParams(params);
 
   if (selector && selectorHasAnyField(selector)) {
     const response = await androidBridgeRpc(deviceId, "inputText", {
       text,
+      ...bridgeDisplayTarget(target),
       ...flattenSelector(selector)
     });
     const result = normalizeBridgeSuccess(response);
     if (pressEnter) {
-      await androidBridgeRpc(deviceId, "key", { key: "ENTER" });
+      await androidBridgeRpc(deviceId, "key", { key: "ENTER", ...bridgeDisplayTarget(target) });
     }
     return result;
   }
 
-  const response = await androidBridgeRpc(deviceId, "inputText", { text });
+  const response = await androidBridgeRpc(deviceId, "inputText", { text, ...bridgeDisplayTarget(target) });
   const result = normalizeBridgeSuccess(response);
   if (pressEnter) {
-    await androidBridgeRpc(deviceId, "key", { key: "ENTER" });
+    await androidBridgeRpc(deviceId, "key", { key: "ENTER", ...bridgeDisplayTarget(target) });
   }
   return result;
 }
@@ -2421,12 +2592,14 @@ async function androidPerformAction(input: unknown): Promise<ToolResult> {
   const action = stringParam(params, "action");
   const text = optionalStringParam(params, "text");
   const selector = optionalSelectorParam(params, "selector");
+  const target = displayTargetParams(params);
   if (!selector || !selectorHasAnyField(selector)) {
     throw new ToolInputError("selector is required and must identify a node.");
   }
   const response = await androidBridgeRpc(deviceId, "performAction", {
     action,
     ...(text !== undefined ? { text } : {}),
+    ...bridgeDisplayTarget(target),
     ...flattenSelector(selector)
   });
   return normalizeBridgeSuccess(response);
@@ -2439,7 +2612,8 @@ async function androidLongPress(input: unknown): Promise<ToolResult> {
   const y = numberParam(params, "y");
   const durationMs = params.durationMs === undefined ? 650 : numberParam(params, "durationMs");
   const steps = Math.max(1, Math.round(durationMs / 5));
-  const response = await androidBridgeRpc(deviceId, "longPress", { x, y, steps });
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "longPress", { x, y, steps, ...bridgeDisplayTarget(target) });
   return normalizeBridgeSuccess({ ...response, durationMs, steps });
 }
 
@@ -2451,20 +2625,27 @@ async function androidKey(input: unknown): Promise<ToolResult> {
   if (!keycode) {
     throw new ToolInputError(`key must be one of: ${Object.keys(KEYCODES).join(", ")}.`);
   }
-  const response = await androidBridgeRpc(deviceId, "key", { key });
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "key", { key, ...bridgeDisplayTarget(target) });
   return normalizeBridgeSuccess({ ...response, key, keycode });
 }
 
 async function androidGoHome(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
-  const response = await androidBridgeRpc(deviceId, "key", { key: "HOME" });
+  const target = displayTargetParams(params);
+  const response = await androidBridgeRpc(deviceId, "key", { key: "HOME", ...bridgeDisplayTarget(target) });
   return normalizeBridgeSuccess({ ...response, key: "HOME", keycode: KEYCODES.HOME });
 }
 
 async function androidCurrentApp(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
   const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  if (hasDisplayTarget(target)) {
+    const snapshot = await currentAccessibilitySnapshot(deviceId, target);
+    return { success: true, deviceId, packageName: snapshot.packageName, displayId: snapshot.displayId, ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}) };
+  }
   const response = await androidBridgeRpc(deviceId, "currentApp");
   return {
     ...response,
@@ -2478,8 +2659,9 @@ async function androidWaitForPackage(input: unknown): Promise<ToolResult> {
   const deviceId = await deviceIdParam(params);
   const packageName = stringParam(params, "packageName");
   const wait = waitOptions(params);
+  const target = displayTargetParams(params);
   const result = await pollUntil(wait, async () => {
-    const current = await androidCurrentApp({ deviceId });
+    const current = await androidCurrentApp({ deviceId, ...target });
     return {
       done: current.packageName === packageName,
       data: { currentApp: current }
@@ -2495,8 +2677,9 @@ async function androidWaitForText(input: unknown): Promise<ToolResult> {
   const role = optionalStringParam(params, "role");
   const fuzzy = optionalBooleanParam(params, "fuzzy", false);
   const wait = waitOptions(params);
+  const target = displayTargetParams(params);
   const result = await pollUntil(wait, async () => {
-    const snapshot = await currentAccessibilitySnapshot(deviceId);
+    const snapshot = await currentAccessibilitySnapshot(deviceId, target);
     const matches = findNodesByLocator(snapshot.nodes, { text, role, fuzzy });
     return {
       done: matches.length > 0,
@@ -2515,6 +2698,7 @@ async function androidWaitForScreenChange(input: unknown): Promise<ToolResult> {
   const wait = waitOptions(params);
   const snapshotId = optionalStringParam(params, "snapshotId");
   const screenSignature = optionalStringParam(params, "screenSignature");
+  const requestedTarget = displayTargetParams(params);
   const cached = snapshotId ? snapshotCache.get(snapshotId) : undefined;
   if (snapshotId && !cached && !screenSignature) {
     throw new ToolInputError("The requested snapshotId is no longer cached. Call android_get_semantic_screen again.");
@@ -2523,16 +2707,24 @@ async function androidWaitForScreenChange(input: unknown): Promise<ToolResult> {
   if (requestedDeviceId && cached && requestedDeviceId !== cached.deviceId) {
     throw new ToolInputError(`snapshotId belongs to device '${cached.deviceId}', not '${requestedDeviceId}'.`);
   }
+  const target = cached
+    ? (cached.sessionId ? { sessionId: cached.sessionId } : { displayId: cached.displayId })
+    : requestedTarget;
+  if (cached && hasDisplayTarget(requestedTarget)) {
+    const requestedIdentity = requestedTarget.sessionId ?? `display-${requestedTarget.displayId ?? 0}`;
+    const cachedIdentity = cached.sessionId ?? `display-${cached.displayId}`;
+    if (requestedIdentity !== cachedIdentity) throw new ToolInputError(`snapshotId belongs to '${cachedIdentity}', not '${requestedIdentity}'.`);
+  }
   let baseline = screenSignature;
   if (!baseline && snapshotId) {
     baseline = cached?.screenSignature;
   }
   if (!baseline) {
-    baseline = (await currentAccessibilitySnapshot(deviceId)).screenSignature;
+    baseline = (await currentAccessibilitySnapshot(deviceId, target)).screenSignature;
   }
 
   const result = await pollUntil(wait, async () => {
-    const snapshot = await currentAccessibilitySnapshot(deviceId);
+    const snapshot = await currentAccessibilitySnapshot(deviceId, target);
     return {
       done: snapshot.screenSignature !== baseline,
       data: { baselineScreenSignature: baseline, currentSnapshot: snapshot }
@@ -2557,6 +2749,71 @@ async function androidBridgeExit(input: unknown): Promise<ToolResult> {
   const response = await deviceManager.runOnDevice(deviceId, () => bridgeRpcOnPort(deviceId, bridge.port, "exit"));
   deviceManager.stopBridge(deviceId);
   return normalizeBridgeSuccess(response);
+}
+
+async function androidProbeVirtualDisplay(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const width = (params as Record<string, unknown>).width ?? 1024;
+  const height = (params as Record<string, unknown>).height ?? 768;
+  const dpi = (params as Record<string, unknown>).dpi ?? 160;
+  const response = await androidBridgeRpc(deviceId, "probeVirtualDisplay", {
+    width: Number(width),
+    height: Number(height),
+    dpi: Number(dpi)
+  });
+  return normalizeBridgeSuccess(response);
+}
+
+async function androidCreateVirtualDisplay(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const width = optionalIntegerParam(params, "width", DEFAULT_VIRTUAL_DISPLAY_WIDTH);
+  const height = optionalIntegerParam(params, "height", DEFAULT_VIRTUAL_DISPLAY_HEIGHT);
+  const dpi = optionalIntegerParam(params, "dpi", DEFAULT_VIRTUAL_DISPLAY_DPI);
+  const systemDecorations = optionalBooleanParam(params, "systemDecorations", true);
+  const destroyContentOnRemoval = optionalBooleanParam(params, "destroyContentOnRemoval", true);
+  const displayImePolicy = params.displayImePolicy === undefined ? undefined : optionalIntegerParam(params, "displayImePolicy", 0);
+  if (width < 100 || height < 100 || dpi < 80) {
+    throw new ToolInputError("width and height must be at least 100, and dpi must be at least 80.");
+  }
+  const response = await androidBridgeRpc(deviceId, "createVirtualDisplay", { width, height, dpi, systemDecorations, destroyContentOnRemoval, ...(displayImePolicy !== undefined ? { displayImePolicy } : {}) });
+  invalidateVirtualSessions(deviceId, "virtual_display_recreated");
+  if (typeof response.sessionId === "string") {
+    activeVirtualSessions.set(response.sessionId, deviceId);
+    staleVirtualSessions.delete(response.sessionId);
+  }
+  return normalizeBridgeSuccess({ ...response, deviceId });
+}
+
+async function androidDestroyVirtualDisplay(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  if (!hasDisplayTarget(target)) {
+    throw new ToolInputError("Provide sessionId or displayId.");
+  }
+  if (target.displayId === 0) {
+    throw new ToolInputError("displayId 0 cannot be destroyed.");
+  }
+  const response = await androidBridgeRpc(deviceId, "destroyVirtualDisplay", {
+    ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+    ...(target.displayId !== undefined ? { displayId: target.displayId } : {})
+  });
+  const destroyedSessionId = typeof response.sessionId === "string" ? response.sessionId : target.sessionId;
+  invalidateSnapshots(deviceId, destroyedSessionId);
+  if (destroyedSessionId) {
+    activeVirtualSessions.delete(destroyedSessionId);
+    staleVirtualSessions.set(destroyedSessionId, "virtual_display_not_found");
+  }
+  return normalizeBridgeSuccess({ ...response, deviceId });
+}
+
+async function androidListDisplays(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const deviceId = await deviceIdParam(params);
+  const response = await androidBridgeRpc(deviceId, "listDisplays");
+  return normalizeBridgeSuccess({ ...response, deviceId });
 }
 
 function normalizeBridgeSuccess(response: Record<string, unknown>): ToolResult {
@@ -2610,6 +2867,7 @@ async function androidLaunchApp(input: unknown): Promise<ToolResult> {
   const appName = optionalStringParam(params, "appName");
   const allowSubstring = optionalBooleanParam(params, "allowSubstring", true);
   optionalBooleanParam(params, "resolveLabels", true);
+  const displayTarget = displayTargetParams(params);
 
   if (!applicationId && !appName) {
     throw new ToolInputError("Provide applicationId or appName.");
@@ -2625,7 +2883,11 @@ async function androidLaunchApp(input: unknown): Promise<ToolResult> {
       `No launcher app matched appName '${appName}'. Call android_list_apps, then launch by applicationId.`
     );
   }
-  const response = await androidBridgeRpc(deviceId, "launchApp", { applicationId: target.applicationId });
+  const response = await androidBridgeRpc(deviceId, "launchApp", {
+    applicationId: target.applicationId,
+    ...(displayTarget.sessionId ? { sessionId: displayTarget.sessionId } : {}),
+    ...(displayTarget.displayId !== undefined ? { displayId: displayTarget.displayId } : {})
+  });
   const result = normalizeBridgeSuccess(response);
 
   return {
@@ -2787,6 +3049,10 @@ const stableSnapshotProperties = {
 const deviceProperties = {
   deviceId: { type: "string", minLength: 1, description: "ADB device serial. Omit only when exactly one authorized device is connected." }
 };
+const displayTargetProperties = {
+  sessionId: { type: "string", minLength: 1, description: "MCP-owned virtual display session ID." },
+  displayId: { type: "integer", minimum: 0, description: "Android display ID. Omit for the default physical display." }
+};
 
 const tools: ToolDefinition[] = [
   {
@@ -2808,9 +3074,63 @@ const tools: ToolDefinition[] = [
     handler: androidBridgeExit
   },
   {
+    name: "android_probe_virtual_display",
+    description: "PROBE: Attempt to create a secondary virtual display from the UIAutomator bridge. Returns display ID and info on success, or detailed error on failure.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProperties,
+        width: { type: "integer", minimum: 100, default: 1024 },
+        height: { type: "integer", minimum: 100, default: 768 },
+        dpi: { type: "integer", minimum: 80, default: 160 }
+      },
+      additionalProperties: false
+    },
+    handler: androidProbeVirtualDisplay
+  },
+  {
+    name: "android_create_virtual_display",
+    description: "Create one MCP-owned Android 14+ virtual display and return its sessionId and displayId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProperties,
+        width: { type: "integer", minimum: 100, default: DEFAULT_VIRTUAL_DISPLAY_WIDTH },
+        height: { type: "integer", minimum: 100, default: DEFAULT_VIRTUAL_DISPLAY_HEIGHT },
+        dpi: { type: "integer", minimum: 80, default: DEFAULT_VIRTUAL_DISPLAY_DPI },
+        systemDecorations: { type: "boolean", default: true },
+        destroyContentOnRemoval: { type: "boolean", default: true },
+        displayImePolicy: {
+          type: "integer",
+          minimum: 0,
+          maximum: 1,
+          description: "Optional Android display IME policy: 0 local, 1 fallback to default display. Omit to keep the system default."
+        }
+      },
+      additionalProperties: false
+    },
+    handler: androidCreateVirtualDisplay
+  },
+  {
+    name: "android_destroy_virtual_display",
+    description: "Destroy an MCP-owned virtual display by sessionId or displayId.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProperties, ...displayTargetProperties },
+      additionalProperties: false
+    },
+    handler: androidDestroyVirtualDisplay
+  },
+  {
+    name: "android_list_displays",
+    description: "List Android displays visible to the bridge and mark MCP-owned virtual displays.",
+    inputSchema: { type: "object", properties: deviceProperties, additionalProperties: false },
+    handler: androidListDisplays
+  },
+  {
     name: "android_current_app",
     description: "Return the current foreground Android package reported by the on-device bridge.",
-    inputSchema: { type: "object", properties: deviceProperties, additionalProperties: false },
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
     handler: androidCurrentApp
   },
   {
@@ -2821,6 +3141,7 @@ const tools: ToolDefinition[] = [
       required: ["packageName"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         packageName: { type: "string", minLength: 1 },
         timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
         pollIntervalMs: { type: "integer", minimum: 50, default: DEFAULT_WAIT_POLL_INTERVAL_MS }
@@ -2837,6 +3158,7 @@ const tools: ToolDefinition[] = [
       required: ["text"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         text: { type: "string", minLength: 1 },
         role: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
@@ -2854,6 +3176,7 @@ const tools: ToolDefinition[] = [
       type: "object",
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         snapshotId: { type: "string", minLength: 1 },
         screenSignature: { type: "string", minLength: 1 },
         timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_WAIT_TIMEOUT_MS },
@@ -2870,11 +3193,13 @@ const tools: ToolDefinition[] = [
       type: "object",
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         retain: {
           type: "boolean",
           default: false,
           description: "When false, overwrite one stable temp screenshot. When true, keep this screenshot in a unique temp directory."
-        }
+        },
+        timeoutMs: { type: "integer", minimum: 1, default: DEFAULT_VIRTUAL_FRAME_TIMEOUT_MS, description: "Bridge frame timeout for virtual display screenshots." }
       },
       additionalProperties: false
     },
@@ -2885,7 +3210,7 @@ const tools: ToolDefinition[] = [
     description: "Run local OCR on the current Android screenshot and return compact text nodes with bounds and centers.",
     inputSchema: {
       type: "object",
-      properties: { ...deviceProperties, ...ocrCommonProperties },
+      properties: { ...deviceProperties, ...displayTargetProperties, ...ocrCommonProperties },
       additionalProperties: false
     },
     handler: androidOcrScreen
@@ -2897,6 +3222,7 @@ const tools: ToolDefinition[] = [
       type: "object",
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         ocrMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
         visionMode: { type: "string", enum: ["auto", "force", "off"], default: "auto", description: "Visual icon/button detection mode. auto: run when accessibility tree is sparse. force: always run. off: never run." },
         includeScreenshot: { type: "boolean", default: true },
@@ -2911,13 +3237,13 @@ const tools: ToolDefinition[] = [
   {
     name: "android_dump_tree",
     description: "Dump the current Android accessibility tree as XML through the persistent on-device UIAutomator bridge.",
-    inputSchema: { type: "object", properties: deviceProperties, additionalProperties: false },
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
     handler: androidDumpTree
   },
   {
     name: "android_dump_compact",
     description: "Return a compact accessibility-node list from the persistent on-device UIAutomator bridge.",
-    inputSchema: { type: "object", properties: deviceProperties, additionalProperties: false },
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
     handler: androidDumpCompactForInput
   },
   {
@@ -2926,7 +3252,7 @@ const tools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       required: ["x", "y"],
-      properties: { ...deviceProperties, x: integerSchema, y: integerSchema, ...stableSnapshotProperties },
+      properties: { ...deviceProperties, ...displayTargetProperties, x: integerSchema, y: integerSchema, ...stableSnapshotProperties },
       additionalProperties: false
     },
     handler: androidTap
@@ -2939,6 +3265,7 @@ const tools: ToolDefinition[] = [
       required: ["snapshotId", "ref"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         snapshotId: { type: "string", minLength: 1 },
         ref: { type: "string", minLength: 1 },
         ...stableSnapshotProperties
@@ -2955,6 +3282,7 @@ const tools: ToolDefinition[] = [
       required: ["snapshotId", "ref", "text"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         snapshotId: { type: "string", minLength: 1 },
         ref: { type: "string", minLength: 1 },
         text: { type: "string", minLength: 1 },
@@ -2973,6 +3301,7 @@ const tools: ToolDefinition[] = [
       required: ["snapshotId", "ref"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         snapshotId: { type: "string", minLength: 1 },
         ref: { type: "string", minLength: 1 },
         durationMs: { ...integerSchema, default: 650 },
@@ -2990,6 +3319,7 @@ const tools: ToolDefinition[] = [
       required: ["snapshotId", "ref", "action"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         snapshotId: { type: "string", minLength: 1 },
         ref: { type: "string", minLength: 1 },
         action: { type: "string", minLength: 1 },
@@ -3008,6 +3338,7 @@ const tools: ToolDefinition[] = [
       required: ["text"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         text: { type: "string", minLength: 1 },
         role: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
@@ -3025,6 +3356,7 @@ const tools: ToolDefinition[] = [
       required: ["contentDesc"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         contentDesc: { type: "string", minLength: 1 },
         role: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
@@ -3041,6 +3373,7 @@ const tools: ToolDefinition[] = [
       type: "object",
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         resourceId: { type: "string", minLength: 1 },
         text: { type: "string", minLength: 1 },
         contentDesc: { type: "string", minLength: 1 },
@@ -3061,6 +3394,7 @@ const tools: ToolDefinition[] = [
       required: ["label", "text"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         label: { type: "string", minLength: 1 },
         text: { type: "string", minLength: 1 },
         fuzzy: { type: "boolean", default: false },
@@ -3079,6 +3413,7 @@ const tools: ToolDefinition[] = [
       required: ["x1", "y1", "x2", "y2"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         x1: integerSchema,
         y1: integerSchema,
         x2: integerSchema,
@@ -3098,6 +3433,7 @@ const tools: ToolDefinition[] = [
       required: ["text"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         text: { type: "string", minLength: 1 },
         selector: selectorSchema,
         pressEnter: { type: "boolean", default: false }
@@ -3114,6 +3450,7 @@ const tools: ToolDefinition[] = [
       required: ["action", "selector"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         action: { type: "string", minLength: 1 },
         selector: selectorSchema,
         text: { type: "string", minLength: 1, description: "Text used by the set_text action." }
@@ -3130,6 +3467,7 @@ const tools: ToolDefinition[] = [
       required: ["x", "y"],
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         x: integerSchema,
         y: integerSchema,
         durationMs: { ...integerSchema, default: 650 }
@@ -3144,7 +3482,7 @@ const tools: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       required: ["key"],
-      properties: { ...deviceProperties, key: { type: "string", enum: Object.keys(KEYCODES) } },
+      properties: { ...deviceProperties, ...displayTargetProperties, key: { type: "string", enum: Object.keys(KEYCODES) } },
       additionalProperties: false
     },
     handler: androidKey
@@ -3152,7 +3490,7 @@ const tools: ToolDefinition[] = [
   {
     name: "android_go_home",
     description: "Send the HOME key event through the persistent on-device UIAutomator bridge.",
-    inputSchema: { type: "object", properties: deviceProperties, additionalProperties: false },
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
     handler: androidGoHome
   },
   {
@@ -3177,6 +3515,7 @@ const tools: ToolDefinition[] = [
       type: "object",
       properties: {
         ...deviceProperties,
+        ...displayTargetProperties,
         applicationId: { type: "string", minLength: 1 },
         appName: { type: "string", minLength: 1 },
         allowSubstring: { type: "boolean", default: true },
@@ -3266,19 +3605,21 @@ async function handleToolCall(id: JsonRpcId | undefined, params: unknown): Promi
 
 let buffer = "";
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  buffer += chunk;
-  let newlineIndex = buffer.indexOf("\n");
-  while (newlineIndex !== -1) {
-    const line = buffer.slice(0, newlineIndex).trim();
-    buffer = buffer.slice(newlineIndex + 1);
-    if (line.length > 0) {
-      void parseAndHandle(line);
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.length > 0) {
+        void parseAndHandle(line);
+      }
+      newlineIndex = buffer.indexOf("\n");
     }
-    newlineIndex = buffer.indexOf("\n");
-  }
-});
+  });
+}
 
 async function parseAndHandle(line: string): Promise<void> {
   try {
@@ -3289,3 +3630,13 @@ async function parseAndHandle(line: string): Promise<void> {
     sendError(null, -32700, err.message);
   }
 }
+
+export const __test = {
+  displayTargetParams,
+  bridgeDisplayTarget,
+  createSemanticSnapshot,
+  invalidateVirtualSessions,
+  activeVirtualSessions,
+  staleVirtualSessions,
+  snapshotCache
+};

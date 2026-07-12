@@ -9,6 +9,9 @@ Bridge-backed MCP tools:
 - `android_list_devices`
 - `android_bridge_ping`
 - `android_bridge_exit`
+- `android_create_virtual_display`
+- `android_destroy_virtual_display`
+- `android_list_displays`
 - `android_current_app`
 - `android_wait_for_package`
 - `android_wait_for_text`
@@ -39,11 +42,21 @@ ADB-backed MCP tools:
 - `android_screenshot`
 - `android_ocr_screen`
 
+Display 0 screenshots are ADB-backed. When `sessionId` or a non-zero MCP-owned
+`displayId` is supplied, screenshot/OCR capture is bridge-backed through the virtual
+display's ImageReader.
+
 Device-backed tools accept optional `deviceId`, using the ADB serial. If omitted,
 the server uses `ANDROID_SERIAL` when set, otherwise auto-selects only when exactly
 one authorized device is connected. With no authorized devices it returns
 `no_device`; with multiple authorized devices it returns `ambiguous_device`.
 The desktop MCP server starts one UIAutomator bridge per selected device on demand.
+
+Display-capable tools accept exactly one of `sessionId` or `displayId`. Omitting both
+targets display 0. `sessionId` is preferred because Android can reuse numeric display
+IDs. Virtual display snapshots include display identity in `snapshotId`; ref actions
+reject a different target. Lifecycle failures use `virtual_display_not_found`,
+`virtual_display_recreated`, or `bridge_restarted`.
 
 `android_get_semantic_screen` combines ADB screenshot capture with bridge-backed compact tree access. Its `ocrMode` parameter controls OCR fallback:
 
@@ -145,6 +158,10 @@ Supported bridge methods:
 - `key`
 - `listApps`
 - `launchApp`
+- `createVirtualDisplay`
+- `destroyVirtualDisplay`
+- `listDisplays`
+- `captureFrame`
 
 Request:
 

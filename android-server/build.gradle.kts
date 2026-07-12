@@ -211,6 +211,7 @@ tasks.register<Exec>("compileKotlinServer") {
 
 tasks.register<Exec>("dexUiautomatorServer") {
   dependsOn("jarKotlinClasses")
+  inputs.file(rawJar)
   outputs.dir(dexDir)
 
   doFirst {
@@ -236,6 +237,7 @@ tasks.register<Exec>("dexUiautomatorServer") {
 
 tasks.register<Exec>("jarKotlinClasses") {
   dependsOn("compileKotlinServer")
+  inputs.dir(classesDir)
   outputs.file(rawJar)
 
   doFirst {
@@ -256,6 +258,7 @@ tasks.register<Exec>("buildUiautomatorJar") {
   group = "build"
   description = "Builds build/android-ui-server.jar for adb shell uiautomator runtest."
   dependsOn("dexUiautomatorServer")
+  inputs.dir(dexDir)
   outputs.file(finalJar)
 
   doFirst {

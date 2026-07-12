@@ -2,6 +2,15 @@
 
 package com.example.androiduiserver
 
+import android.content.Context
+import android.content.ContextWrapper
+import android.app.ActivityOptions
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
 import android.os.Binder
 import android.graphics.Rect
 import android.net.LocalServerSocket
@@ -9,28 +18,37 @@ import android.net.LocalSocket
 import android.os.PowerManager
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Base64
 import android.view.KeyEvent
+import android.view.InputEvent
+import android.view.MotionEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import com.android.uiautomator.core.UiDevice
 import com.android.uiautomator.testrunner.UiAutomatorTestCase
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileReader
 import java.io.IOException
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.lang.StringBuilder
+import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.nio.charset.StandardCharsets
 import java.util.LinkedHashMap
+import java.util.UUID
 
 class BridgeTest : UiAutomatorTestCase() {
   private lateinit var device: UiDevice
   private val wakeLockToken = Binder()
   private var wakeLockHeld = false
   @Volatile private var running = false
+  private var probeDisplay: VirtualDisplay? = null
+  private var probeImageReader: ImageReader? = null
+  private val displaySessions = LinkedHashMap<String, DisplaySession>()
 
   override fun setUp() {
     super.setUp()
@@ -41,6 +59,7 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   override fun tearDown() {
+    releaseDisplaySessions()
     releaseWakeLock()
     super.tearDown()
   }
@@ -94,6 +113,17 @@ class BridgeTest : UiAutomatorTestCase() {
     releaseWakeLock.invoke(powerManager, wakeLockToken, 0)
   }
 
+  private fun releaseDisplaySessions() {
+    for (session in displaySessions.values.toList()) {
+      session.release()
+    }
+    displaySessions.clear()
+    probeDisplay?.release()
+    probeDisplay = null
+    probeImageReader?.close()
+    probeImageReader = null
+  }
+
   @Throws(Exception::class)
   private fun powerService(): Any {
     val serviceManager = Class.forName("android.os.ServiceManager")
@@ -142,29 +172,24 @@ class BridgeTest : UiAutomatorTestCase() {
   private fun dispatch(request: Map<String, String>): LinkedHashMap<String, Any?> {
     return when (val method = request["method"] ?: throw IllegalArgumentException("missing method")) {
       "ping" -> ok("pong", "pong")
-      "dumpCompact" -> dumpCompact()
-      "dumpXml" -> dumpXml()
-      "tap" -> bool("success", device.click(intParam(request, "x"), intParam(request, "y")))
+      "dumpCompact" -> dumpCompact(request)
+      "dumpXml" -> dumpXml(request)
+      "tap" -> tap(request)
       "inputText" -> inputText(request)
       "performAction" -> performAction(request)
       "longPress" -> longPress(request)
       "currentApp" -> currentApp()
       "listApps" -> listApps()
       "launchApp" -> launchApp(request)
-      "swipe" -> {
-        val success =
-          device.swipe(
-            intParam(request, "x1"),
-            intParam(request, "y1"),
-            intParam(request, "x2"),
-            intParam(request, "y2"),
-            intParam(request, "steps", 24)
-          )
-        device.waitForIdle(500)
-        bool("success", success)
-      }
-      "key" -> bool("success", device.pressKeyCode(keyCode(request["key"])))
+      "swipe" -> swipe(request)
+      "key" -> key(request)
+      "probeVirtualDisplay" -> probeVirtualDisplay(request)
+      "createVirtualDisplay" -> createVirtualDisplay(request)
+      "destroyVirtualDisplay" -> destroyVirtualDisplay(request)
+      "listDisplays" -> listDisplays()
+      "captureFrame" -> captureFrame(request)
       "exit" -> {
+        releaseDisplaySessions()
         running = false
         bool("success", true)
       }
@@ -173,9 +198,12 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   @Throws(Exception::class)
-  private fun dumpCompact(): LinkedHashMap<String, Any?> {
+  private fun dumpCompact(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val target = resolveDisplayTarget(request)
     val nodes = ArrayList<Any>()
-    val roots = rootNodes()
+    val roots = rootNodes(target.displayId)
+    val packageNames = roots.mapNotNull { root -> root.packageName?.toString()?.takeIf { it.isNotBlank() } }.distinct()
+    val packageName = packageNames.firstOrNull { it != "com.android.systemui" } ?: packageNames.firstOrNull().orEmpty()
     for (root in roots) {
       try {
         collectCompactNodes(root, nodes, 0)
@@ -186,9 +214,12 @@ class BridgeTest : UiAutomatorTestCase() {
 
     return linkedMapOf(
       "ok" to true,
-      "packageName" to device.currentPackageName,
-      "width" to device.displayWidth,
-      "height" to device.displayHeight,
+      "packageName" to packageName,
+      "packageNames" to packageNames,
+      "width" to target.width,
+      "height" to target.height,
+      "displayId" to target.displayId,
+      "sessionId" to target.sessionId,
       "nodes" to nodes,
       "nodeCount" to nodes.size
     )
@@ -202,22 +233,24 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   @Throws(Exception::class)
-  private fun rootNodes(): List<AccessibilityNodeInfo> {
+  private fun rootNodes(displayId: Int = 0): List<AccessibilityNodeInfo> {
     device.waitForIdle(500)
     val bridge = invokeNoArg(device, "getAutomatorBridge") ?: throw IllegalStateException("missing automator bridge")
     val roots = ArrayList<AccessibilityNodeInfo>()
 
-    val activeRoot = invokeNoArg(bridge, "getRootInActiveWindow") as AccessibilityNodeInfo?
-    if (activeRoot != null) {
-      roots.add(activeRoot)
-      return roots
+    if (displayId == 0) {
+      val activeRoot = invokeNoArg(bridge, "getRootInActiveWindow") as AccessibilityNodeInfo?
+      if (activeRoot != null) {
+        roots.add(activeRoot)
+        return roots
+      }
     }
 
     val uiAutomation = readField(bridge, "mUiAutomation") ?: throw IllegalStateException("missing ui automation")
-    val getWindows = uiAutomation.javaClass.getMethod("getWindows")
-    @Suppress("UNCHECKED_CAST")
-    val windows = getWindows.invoke(uiAutomation) as List<AccessibilityWindowInfo>
+    enableInteractiveWindows(uiAutomation)
+    val windows = allAccessibilityWindows(uiAutomation, displayId)
     for (window in windows) {
+      if (window.displayId != displayId) continue
       val root = window.root
       if (root != null) {
         roots.add(root)
@@ -226,8 +259,52 @@ class BridgeTest : UiAutomatorTestCase() {
     return roots
   }
 
+  private fun enableInteractiveWindows(uiAutomation: Any) {
+    try {
+      val getServiceInfo = uiAutomation.javaClass.getMethod("getServiceInfo")
+      val info = getServiceInfo.invoke(uiAutomation) ?: return
+      val flagsField = info.javaClass.getField("flags")
+      val flags = flagsField.getInt(info)
+      if (flags.and(0x40) == 0) {
+        flagsField.setInt(info, flags.or(0x40)) // FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        val setServiceInfo = uiAutomation.javaClass.getMethod("setServiceInfo", info.javaClass)
+        setServiceInfo.invoke(uiAutomation, info)
+        SystemClock.sleep(100)
+      }
+    } catch (_: Throwable) {
+      // Continue with the existing UiAutomation service configuration.
+    }
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  private fun allAccessibilityWindows(uiAutomation: Any, displayId: Int): List<AccessibilityWindowInfo> {
+    if (displayId != 0) {
+      try {
+        val method = uiAutomation.javaClass.getMethod("getWindowsOnAllDisplays")
+        val sparse = method.invoke(uiAutomation) ?: return emptyList()
+        val sparseClass = sparse.javaClass
+        val size = sparseClass.getMethod("size").invoke(sparse) as Int
+        val valueAt = sparseClass.getMethod("valueAt", Int::class.javaPrimitiveType)
+        val windows = ArrayList<AccessibilityWindowInfo>()
+        for (index in 0 until size) {
+          val value = valueAt.invoke(sparse, index) as? List<AccessibilityWindowInfo> ?: continue
+          windows.addAll(value)
+        }
+        return windows
+      } catch (_: NoSuchMethodException) {
+        // Android 14+ exposes this API; retain a conservative fallback for OEM variants.
+      }
+    }
+    val getWindows = uiAutomation.javaClass.getMethod("getWindows")
+    return getWindows.invoke(uiAutomation) as List<AccessibilityWindowInfo>
+  }
+
   @Throws(Exception::class)
-  private fun dumpXml(): LinkedHashMap<String, Any?> {
+  private fun dumpXml(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val target = resolveDisplayTarget(request)
+    if (target.displayId != 0) {
+      throw IllegalArgumentException("display_not_supported: XML dump is only available for display 0")
+    }
     return linkedMapOf("ok" to true, "xml" to dumpXmlString())
   }
 
@@ -258,14 +335,14 @@ class BridgeTest : UiAutomatorTestCase() {
     val selector = selectorFromRequest(request)
 
     if (selector.hasAnyField()) {
-      val success = performOnMatchingNode(selector) { node ->
+      val success = performOnMatchingNode(selector, resolveDisplayTarget(request).displayId) { node ->
         setNodeText(node, text, "selected node")
       }
       if (!success) {
         throw IllegalArgumentException("no accessibility node matched the provided selector")
       }
     } else {
-      performOnFocusedInput { node ->
+      performOnFocusedInput(resolveDisplayTarget(request).displayId) { node ->
         setNodeText(node, text, "focused node")
       }
     }
@@ -284,7 +361,7 @@ class BridgeTest : UiAutomatorTestCase() {
 
     var performedActionLabel: String? = null
     val success =
-      performOnMatchingNode(selector) { node ->
+      performOnMatchingNode(selector, resolveDisplayTarget(request).displayId) { node ->
         val customAction = resolveCustomAction(node, actionName)
         val predefinedActionId = actionId(actionName)
         val performed = if (customAction != null) {
@@ -319,9 +396,518 @@ class BridgeTest : UiAutomatorTestCase() {
     val x = intParam(request, "x")
     val y = intParam(request, "y")
     val steps = intParam(request, "steps", 130)
-    val success = longTap(x, y) || device.swipe(x, y, x + 1, y + 1, steps)
+    val target = resolveDisplayTarget(request)
+    val success = if (target.displayId == 0) {
+      longTap(x, y) || device.swipe(x, y, x + 1, y + 1, steps)
+    } else {
+      injectSwipe(target.displayId, x, y, x, y, steps)
+    }
     device.waitForIdle(500)
-    return linkedMapOf("ok" to true, "success" to success, "x" to x, "y" to y, "steps" to steps)
+    return linkedMapOf("ok" to true, "success" to success, "x" to x, "y" to y, "steps" to steps, "displayId" to target.displayId, "sessionId" to target.sessionId)
+  }
+
+  private fun tap(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val x = intParam(request, "x")
+    val y = intParam(request, "y")
+    val target = resolveDisplayTarget(request)
+    val success = if (target.displayId == 0) device.click(x, y) else injectTap(target.displayId, x, y)
+    device.waitForIdle(500)
+    return linkedMapOf("ok" to true, "success" to success, "x" to x, "y" to y, "displayId" to target.displayId, "sessionId" to target.sessionId)
+  }
+
+  private fun swipe(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val x1 = intParam(request, "x1")
+    val y1 = intParam(request, "y1")
+    val x2 = intParam(request, "x2")
+    val y2 = intParam(request, "y2")
+    val steps = intParam(request, "steps", 24)
+    val target = resolveDisplayTarget(request)
+    val success = if (target.displayId == 0) device.swipe(x1, y1, x2, y2, steps) else injectSwipe(target.displayId, x1, y1, x2, y2, steps)
+    device.waitForIdle(500)
+    return linkedMapOf("ok" to true, "success" to success, "steps" to steps, "displayId" to target.displayId, "sessionId" to target.sessionId)
+  }
+
+  private fun key(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val keyCode = keyCode(request["key"])
+    val target = resolveDisplayTarget(request)
+    val success = if (target.displayId == 0) device.pressKeyCode(keyCode) else injectKey(target.displayId, keyCode)
+    return linkedMapOf("ok" to true, "success" to success, "displayId" to target.displayId, "sessionId" to target.sessionId)
+  }
+
+  private fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
+    val downTime = SystemClock.uptimeMillis()
+    val down = motionEvent(displayId, downTime, downTime, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat())
+    val up = motionEvent(displayId, downTime, downTime + 20, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat())
+    return try {
+      injectInputEvent(down) && injectInputEvent(up)
+    } finally {
+      down.recycle()
+      up.recycle()
+    }
+  }
+
+  private fun injectSwipe(displayId: Int, x1: Int, y1: Int, x2: Int, y2: Int, steps: Int): Boolean {
+    val count = steps.coerceAtLeast(1)
+    val downTime = SystemClock.uptimeMillis()
+    var success = true
+    for (index in 0..count) {
+      val fraction = index.toFloat() / count.toFloat()
+      val action = if (index == 0) MotionEvent.ACTION_DOWN else if (index == count) MotionEvent.ACTION_UP else MotionEvent.ACTION_MOVE
+      val event = motionEvent(displayId, downTime, downTime + index * 5L, action, x1 + (x2 - x1) * fraction, y1 + (y2 - y1) * fraction)
+      try {
+        success = injectInputEvent(event) && success
+      } finally {
+        event.recycle()
+      }
+    }
+    return success
+  }
+
+  private fun injectKey(displayId: Int, keyCode: Int): Boolean {
+    val downTime = SystemClock.uptimeMillis()
+    val down = KeyEvent(downTime, downTime, KeyEvent.ACTION_DOWN, keyCode, 0)
+    val up = KeyEvent(downTime, downTime + 20, KeyEvent.ACTION_UP, keyCode, 0)
+    setInputEventDisplayId(down, displayId)
+    setInputEventDisplayId(up, displayId)
+    return injectInputEvent(down) && injectInputEvent(up)
+  }
+
+  private fun motionEvent(displayId: Int, downTime: Long, eventTime: Long, action: Int, x: Float, y: Float): MotionEvent {
+    val event = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+    event.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+    setInputEventDisplayId(event, displayId)
+    return event
+  }
+
+  private fun setInputEventDisplayId(event: InputEvent, displayId: Int) {
+    val method = InputEvent::class.java.getDeclaredMethod("setDisplayId", Int::class.javaPrimitiveType)
+    method.isAccessible = true
+    method.invoke(event, displayId)
+  }
+
+  private fun injectInputEvent(event: InputEvent): Boolean {
+    val errors = ArrayList<String>()
+    for (className in listOf("android.hardware.input.InputManagerGlobal", "android.hardware.input.InputManager")) {
+      try {
+        val type = Class.forName(className)
+        val instance = type.getDeclaredMethod("getInstance").invoke(null)
+        val method = type.methods.firstOrNull { candidate ->
+          candidate.name == "injectInputEvent" && candidate.parameterCount == 2
+        } ?: throw NoSuchMethodException("injectInputEvent")
+        return method.invoke(instance, event, 2) as Boolean
+      } catch (error: Throwable) {
+        errors.add("$className: ${error.cause?.message ?: error.message}")
+      }
+    }
+    try {
+      val serviceManager = Class.forName("android.os.ServiceManager")
+      val binder = serviceManager.getDeclaredMethod("getService", String::class.java).invoke(null, "input") as android.os.IBinder
+      val stub = Class.forName("android.hardware.input.IInputManager\$Stub")
+      val service = stub.getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
+      val method = service.javaClass.methods.firstOrNull { candidate ->
+        candidate.name == "injectInputEvent" && candidate.parameterCount == 2
+      } ?: throw NoSuchMethodException("IInputManager.injectInputEvent")
+      return method.invoke(service, event, 2) as Boolean
+    } catch (error: Throwable) {
+      errors.add("IInputManager: ${error.cause?.message ?: error.message}")
+    }
+    throw IllegalStateException("input injection unavailable: ${errors.joinToString(" | ")}")
+  }
+
+  @Throws(Exception::class)
+  private fun probeVirtualDisplay(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val width = intParam(request, "width", 1024)
+    val height = intParam(request, "height", 768)
+    val dpi = intParam(request, "dpi", 160)
+
+    var step = "init"
+
+    try {
+      // Step 1: Try DisplayManager via ServiceManager (app_process path)
+      step = "serviceManager"
+      val smClass = Class.forName("android.os.ServiceManager")
+      val getService = smClass.getDeclaredMethod("getService", String::class.java)
+      val displayBinder = getService.invoke(null, "display") as? android.os.IBinder
+        ?: throw NullPointerException("display service binder is null")
+      val iDisplayManagerStub = Class.forName("android.hardware.display.IDisplayManager\$Stub")
+      val asInterface = iDisplayManagerStub.getDeclaredMethod("asInterface", android.os.IBinder::class.java)
+      val displayService = asInterface.invoke(null, displayBinder)
+
+      // Try getting existing display IDs
+      step = "getDisplayIds"
+      val existingIds = try {
+        val dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal")
+        val getInstance = dmgClass.getDeclaredMethod("getInstance")
+        val dmg = getInstance.invoke(null)
+        val getDisplayIds = dmg.javaClass.getMethod("getDisplayIds")
+        (getDisplayIds.invoke(dmg) as IntArray).toList()
+      } catch (_: Exception) {
+        emptyList<Int>()
+      }
+
+      // Step 2: Try ActivityThread systemMain() approach
+      step = "ActivityThread.systemMain"
+      var contextFound = false
+      var ctx: Context? = null
+      try {
+        val atClass = Class.forName("android.app.ActivityThread")
+        val systemMain = atClass.getMethod("systemMain")
+        val at = systemMain.invoke(null)
+        val getSystemContext = atClass.getMethod("getSystemContext")
+        ctx = getSystemContext.invoke(at) as Context
+        contextFound = true
+      } catch (_: Exception) {
+        // Fall through to next approach
+      }
+
+      // Step 3: Try AppGlobals.getInitialApplication
+      if (!contextFound) {
+        step = "AppGlobals"
+        try {
+          val agClass = Class.forName("android.app.AppGlobals")
+          val getInitialApplication = agClass.getMethod("getInitialApplication")
+          val app = getInitialApplication.invoke(null)
+          if (app != null) {
+            ctx = (app as Context).applicationContext
+            contextFound = ctx != null
+          }
+        } catch (_: Exception) {
+          // Fall through
+        }
+      }
+
+      if (!contextFound || ctx == null) {
+        throw IllegalStateException("No Context available: ActivityThread.currentActivityThread=null, systemMain failed, AppGlobals failed")
+      }
+
+      // Step 4: Wrap context with shell identity (matching uiautomator process UID)
+      step = "FakeContext"
+      val shellCtx = object : android.content.ContextWrapper(ctx) {
+        override fun getPackageName(): String = "com.android.shell"
+        override fun getOpPackageName(): String = "com.android.shell"
+      }
+
+      // Step 5: Construct DisplayManager with shell context
+      step = "DisplayManager newInstance"
+      val dmConstructor = android.hardware.display.DisplayManager::class.java
+        .getDeclaredConstructor(Context::class.java)
+      dmConstructor.isAccessible = true
+      val dm = dmConstructor.newInstance(shellCtx)
+
+      // Step 5: Create ImageReader and VirtualDisplay
+      step = "ImageReader"
+      val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+
+      step = "createVirtualDisplay"
+      val flags = (1 shl 0)  // PUBLIC
+        .or(1 shl 1)  // PRESENTATION
+        .or(1 shl 3)  // OWN_CONTENT_ONLY
+        .or(1 shl 6)  // SUPPORTS_TOUCH
+        .or(1 shl 7)  // ROTATES_WITH_CONTENT
+        .or(1 shl 10) // TRUSTED (API 33+)
+        .or(1 shl 11) // OWN_DISPLAY_GROUP (API 33+)
+        .or(1 shl 12) // ALWAYS_UNLOCKED (API 33+)
+        .or(1 shl 13) // TOUCH_FEEDBACK_DISABLED (API 33+)
+        .or(1 shl 14) // OWN_FOCUS (API 34+)
+        .or(1 shl 15) // DEVICE_DISPLAY_GROUP (API 34+)
+      val vd = dm.createVirtualDisplay("mcp-probe", width, height, dpi, imageReader.surface, flags)
+
+      step = "getDisplayId"
+      val displayId = vd.display.displayId
+      val displayName = vd.display.name ?: ""
+
+      probeDisplay = vd
+      probeImageReader = imageReader
+
+      return linkedMapOf(
+        "ok" to true,
+        "created" to true,
+        "displayId" to displayId,
+        "displayName" to displayName,
+        "width" to width,
+        "height" to height,
+        "dpi" to dpi,
+        "existingDisplayIds" to existingIds,
+        "contextClass" to (ctx as Any).javaClass.name,
+        "contextPackage" to ctx.packageName
+      )
+    } catch (e: Exception) {
+      return linkedMapOf(
+        "ok" to true,
+        "created" to false,
+        "step" to step,
+        "errorType" to e.javaClass.simpleName,
+        "errorMessage" to e.message,
+        "errorCause" to (e.cause?.javaClass?.simpleName ?: ""),
+        "errorCauseMessage" to (e.cause?.message ?: "")
+      )
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun createVirtualDisplay(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val width = intParam(request, "width", 1280)
+    val height = intParam(request, "height", 960)
+    val dpi = intParam(request, "dpi", 160)
+    val systemDecorations = request["systemDecorations"]?.toBooleanStrictOrNull() ?: true
+    val destroyContentOnRemoval = request["destroyContentOnRemoval"]?.toBooleanStrictOrNull() ?: true
+    val displayImePolicy = request["displayImePolicy"]?.toIntOrNull()
+    if (width <= 0 || height <= 0 || dpi <= 0) {
+      throw IllegalArgumentException("width, height, and dpi must be positive")
+    }
+
+    releaseDisplaySessions()
+
+    val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+    try {
+      val dm = shellDisplayManager()
+      val flags = virtualDisplayFlags(systemDecorations, destroyContentOnRemoval)
+      val sessionId = "vd-${UUID.randomUUID()}"
+      val vd = dm.createVirtualDisplay("mcp-$sessionId", width, height, dpi, imageReader.surface, flags)
+        ?: throw IllegalStateException("createVirtualDisplay returned null")
+      val displayId = vd.display.displayId
+      val session = DisplaySession(
+        sessionId = sessionId,
+        displayId = displayId,
+        virtualDisplay = vd,
+        imageReader = imageReader,
+        width = width,
+        height = height,
+        dpi = dpi,
+        flags = flags,
+        createdAtMs = SystemClock.uptimeMillis()
+      )
+      displaySessions[sessionId] = session
+      val imePolicyError = if (displayImePolicy != null) {
+        try {
+          setDisplayImePolicy(displayId, displayImePolicy)
+          null
+        } catch (error: Throwable) {
+          "${error.javaClass.simpleName}: ${error.cause?.message ?: error.message}"
+        }
+      } else null
+      return linkedMapOf(
+        "ok" to true,
+        "success" to true,
+        "sessionId" to sessionId,
+        "displayId" to displayId,
+        "width" to width,
+        "height" to height,
+        "dpi" to dpi,
+        "flags" to flags,
+        "systemDecorations" to systemDecorations,
+        "destroyContentOnRemoval" to destroyContentOnRemoval,
+        "displayImePolicy" to displayImePolicy,
+        "displayImePolicyApplied" to (displayImePolicy != null && imePolicyError == null),
+        "displayImePolicyError" to imePolicyError,
+        "displayName" to (vd.display.name ?: "")
+      )
+    } catch (error: Throwable) {
+      imageReader.close()
+      throw error
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun destroyVirtualDisplay(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val session = resolveDisplaySession(request, requireVirtual = true)
+    displaySessions.remove(session.sessionId)
+    session.release()
+    return linkedMapOf(
+      "ok" to true,
+      "success" to true,
+      "sessionId" to session.sessionId,
+      "displayId" to session.displayId
+    )
+  }
+
+  @Throws(Exception::class)
+  private fun listDisplays(): LinkedHashMap<String, Any?> {
+    val ownedByDisplayId = displaySessions.values.associateBy { it.displayId }
+    val displays = ArrayList<Any>()
+    for (display in shellDisplayManager().displays) {
+      val owned = ownedByDisplayId[display.displayId]
+      val item = linkedMapOf<String, Any?>(
+        "displayId" to display.displayId,
+        "name" to (display.name ?: ""),
+        "flags" to display.flags,
+        "mcpOwned" to (owned != null)
+      )
+      if (owned != null) {
+        item["sessionId"] = owned.sessionId
+        item["width"] = owned.width
+        item["height"] = owned.height
+        item["dpi"] = owned.dpi
+        item["createdAtMs"] = owned.createdAtMs
+      }
+      displays.add(item)
+    }
+    return linkedMapOf(
+      "ok" to true,
+      "success" to true,
+      "displays" to displays,
+      "count" to displays.size,
+      "ownedCount" to displaySessions.size
+    )
+  }
+
+  @Throws(Exception::class)
+  private fun captureFrame(request: Map<String, String>): LinkedHashMap<String, Any?> {
+    val session = resolveDisplaySession(request, requireVirtual = true)
+    val timeoutMs = intParam(request, "timeoutMs", 2_000)
+    val pngBase64 = captureVirtualDisplayPngBase64(session, timeoutMs)
+    return linkedMapOf(
+      "ok" to true,
+      "success" to true,
+      "pngBase64" to pngBase64,
+      "width" to session.width,
+      "height" to session.height,
+      "displayId" to session.displayId,
+      "sessionId" to session.sessionId
+    )
+  }
+
+  @Throws(Exception::class)
+  private fun captureVirtualDisplayPngBase64(session: DisplaySession, timeoutMs: Int): String {
+    val deadline = SystemClock.uptimeMillis() + timeoutMs.coerceAtLeast(1)
+    var latest: android.media.Image? = null
+    while (SystemClock.uptimeMillis() <= deadline) {
+      val image = session.imageReader.acquireLatestImage()
+      if (image != null) {
+        latest?.close()
+        latest = image
+        break
+      }
+      SystemClock.sleep(25)
+    }
+    val image = latest ?: return session.lastPngBase64 ?: throw IllegalStateException("virtual display frame timeout")
+    try {
+      val encoded = imageToPngBase64(image, session.width, session.height)
+      session.lastPngBase64 = encoded
+      return encoded
+    } finally {
+      image.close()
+    }
+  }
+
+  private fun imageToPngBase64(image: android.media.Image, width: Int, height: Int): String {
+    val plane = image.planes.firstOrNull() ?: throw IllegalStateException("image has no planes")
+    val buffer = plane.buffer
+    val pixelStride = plane.pixelStride
+    val rowStride = plane.rowStride
+    if (pixelStride <= 0 || rowStride <= 0) {
+      throw IllegalStateException("invalid image stride")
+    }
+    val rowPadding = rowStride - pixelStride * width
+    val bitmapWidth = width + (rowPadding / pixelStride)
+    val padded = Bitmap.createBitmap(bitmapWidth, height, Bitmap.Config.ARGB_8888)
+    padded.copyPixelsFromBuffer(buffer)
+    val bitmap = if (bitmapWidth == width) padded else Bitmap.createBitmap(padded, 0, 0, width, height)
+    if (bitmap !== padded) {
+      padded.recycle()
+    }
+    val out = ByteArrayOutputStream()
+    try {
+      if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+        throw IllegalStateException("failed to encode PNG")
+      }
+      return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+    } finally {
+      bitmap.recycle()
+      out.close()
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun resolveDisplaySession(request: Map<String, String>, requireVirtual: Boolean): DisplaySession {
+    val sessionId = request["sessionId"]
+    val displayId = request["displayId"]?.toIntOrNull()
+    if (sessionId != null && displayId != null) {
+      throw IllegalArgumentException("provide only one of sessionId or displayId")
+    }
+    if (sessionId != null) {
+      return displaySessions[sessionId] ?: throw IllegalArgumentException("virtual_display_not_found: $sessionId")
+    }
+    if (displayId != null) {
+      if (displayId == 0 && requireVirtual) {
+        throw IllegalArgumentException("display_not_supported: bridge capture for display 0 is not implemented")
+      }
+      return displaySessions.values.firstOrNull { it.displayId == displayId }
+        ?: throw IllegalArgumentException("virtual_display_not_found: displayId=$displayId")
+    }
+    if (requireVirtual) {
+      throw IllegalArgumentException("missing sessionId or displayId")
+    }
+    throw IllegalArgumentException("missing display target")
+  }
+
+  @Throws(Exception::class)
+  private fun displayTargetOrNull(request: Map<String, String>): Int? {
+    val sessionId = request["sessionId"]
+    val displayId = request["displayId"]?.toIntOrNull()
+    if (sessionId != null && displayId != null) {
+      throw IllegalArgumentException("provide only one of sessionId or displayId")
+    }
+    if (sessionId != null) {
+      return displaySessions[sessionId]?.displayId ?: throw IllegalArgumentException("virtual_display_not_found: $sessionId")
+    }
+    return displayId
+  }
+
+  private fun resolveDisplayTarget(request: Map<String, String>): DisplayTarget {
+    val sessionId = request["sessionId"]
+    val rawDisplayId = request["displayId"]
+    if (sessionId != null && rawDisplayId != null) {
+      throw IllegalArgumentException("provide only one of sessionId or displayId")
+    }
+    if (sessionId != null) {
+      val session = displaySessions[sessionId]
+        ?: throw IllegalArgumentException("virtual_display_not_found: $sessionId")
+      return DisplayTarget(session.displayId, session.sessionId, session.width, session.height)
+    }
+    val displayId = rawDisplayId?.toIntOrNull()
+      ?: if (rawDisplayId == null) 0 else throw IllegalArgumentException("invalid displayId")
+    if (displayId == 0) {
+      return DisplayTarget(0, null, device.displayWidth, device.displayHeight)
+    }
+    val session = displaySessions.values.firstOrNull { it.displayId == displayId }
+      ?: throw IllegalArgumentException("virtual_display_not_found: displayId=$displayId")
+    return DisplayTarget(session.displayId, session.sessionId, session.width, session.height)
+  }
+
+  @Throws(Exception::class)
+  private fun shellContext(): Context {
+    val ctx = systemContext().createPackageContext("com.android.shell", 0)
+    return object : ContextWrapper(ctx) {
+      override fun getPackageName(): String = "com.android.shell"
+      override fun getOpPackageName(): String = "com.android.shell"
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun shellDisplayManager(): DisplayManager {
+    val constructor = DisplayManager::class.java.getDeclaredConstructor(Context::class.java)
+    constructor.isAccessible = true
+    return constructor.newInstance(shellContext())
+  }
+
+  @Throws(Exception::class)
+  private fun systemContext(): Context {
+    val atClass = Class.forName("android.app.ActivityThread")
+    val systemMain = atClass.getMethod("systemMain")
+    val at = systemMain.invoke(null)
+    val getSystemContext = atClass.getMethod("getSystemContext")
+    return getSystemContext.invoke(at) as Context
+  }
+
+  private fun setDisplayImePolicy(displayId: Int, policy: Int) {
+    val serviceManager = Class.forName("android.os.ServiceManager")
+    val binder = serviceManager.getDeclaredMethod("getService", String::class.java).invoke(null, "window") as android.os.IBinder
+    val stub = Class.forName("android.view.IWindowManager\$Stub")
+    val service = stub.getDeclaredMethod("asInterface", android.os.IBinder::class.java).invoke(null, binder)
+    val method = service.javaClass.methods.firstOrNull { it.name == "setDisplayImePolicy" && it.parameterCount == 2 }
+      ?: throw NoSuchMethodException("setDisplayImePolicy")
+    method.invoke(service, displayId, policy)
   }
 
   private fun listApps(): LinkedHashMap<String, Any?> {
@@ -337,9 +923,103 @@ class BridgeTest : UiAutomatorTestCase() {
     val applicationId = request["applicationId"] ?: throw IllegalArgumentException("missing applicationId")
     val app = launcherApps().find { it["applicationId"] == applicationId }
       ?: throw IllegalArgumentException("no launcher app found for applicationId: $applicationId")
-    shellCommand("monkey -p ${shellQuote(applicationId)} -c android.intent.category.LAUNCHER 1")
+    val displayId = displayTargetOrNull(request)
+    if (displayId == null || displayId == 0) {
+      shellCommand("monkey -p ${shellQuote(applicationId)} -c android.intent.category.LAUNCHER 1")
+    } else {
+      launchAppOnDisplay(applicationId, displayId)
+    }
     device.waitForIdle(500)
-    return linkedMapOf("ok" to true, "success" to true, "launched" to app)
+    return linkedMapOf("ok" to true, "success" to true, "launched" to app, "displayId" to (displayId ?: 0))
+  }
+
+  @Throws(Exception::class)
+  private fun launchAppOnDisplay(applicationId: String, displayId: Int) {
+    val ctx = shellContext()
+    val intent = ctx.packageManager.getLaunchIntentForPackage(applicationId)
+      ?: throw IllegalArgumentException("no launch intent for applicationId: $applicationId")
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val options = ActivityOptions.makeBasic()
+    options.launchDisplayId = displayId
+    try {
+      ctx.startActivity(intent, options.toBundle())
+    } catch (error: SecurityException) {
+      startActivityWithActivityTaskManager(ctx, intent, options.toBundle())
+    }
+  }
+
+  @Throws(Exception::class)
+  private fun startActivityWithActivityTaskManager(ctx: Context, intent: Intent, options: Bundle) {
+    val resolvedType = intent.resolveTypeIfNeeded(ctx.contentResolver)
+    val errors = ArrayList<String>()
+    for (serviceName in listOf("activity_task", "activity")) {
+      val service = activityService(serviceName) ?: continue
+      val methods = service.javaClass.methods
+        .filter { method -> method.name == "startActivityAsUser" || method.name == "startActivity" }
+        .sortedBy { method -> if (method.name == "startActivityAsUser") 0 else 1 }
+      for (method in methods) {
+        try {
+          method.isAccessible = true
+          val args = activityStartArgs(method.parameterTypes, intent, resolvedType, options)
+          method.invoke(service, *args)
+          return
+        } catch (error: InvocationTargetException) {
+          errors.add("${serviceName}.${method.name}/${method.parameterCount}: ${error.cause?.javaClass?.simpleName}: ${error.cause?.message}")
+        } catch (error: Throwable) {
+          errors.add("${serviceName}.${method.name}/${method.parameterCount}: ${error.javaClass.simpleName}: ${error.message}")
+        }
+      }
+    }
+    throw IllegalStateException("display launch failed via ActivityTaskManager: ${errors.joinToString(" | ")}")
+  }
+
+  private fun activityStartArgs(parameterTypes: Array<Class<*>>, intent: Intent, resolvedType: String?, options: Bundle): Array<Any?> {
+    var stringIndex = 0
+    var intIndex = 0
+    return Array(parameterTypes.size) { index ->
+      val type = parameterTypes[index]
+      when {
+        Intent::class.java.isAssignableFrom(type) -> intent
+        Bundle::class.java.isAssignableFrom(type) -> options
+        type == String::class.java -> {
+          val value = when (stringIndex) {
+            0 -> "com.android.shell"
+            2 -> resolvedType
+            else -> null
+          }
+          stringIndex += 1
+          value
+        }
+        type == Int::class.javaPrimitiveType -> {
+          val value = when (intIndex) {
+            0 -> -1
+            1 -> 0
+            else -> 0
+          }
+          intIndex += 1
+          value
+        }
+        else -> null
+      }
+    }
+  }
+
+  private fun activityService(serviceName: String): Any? {
+    return try {
+      if (serviceName == "activity_task") {
+        val activityTaskManager = Class.forName("android.app.ActivityTaskManager")
+        activityTaskManager.getDeclaredMethod("getService").invoke(null)
+      } else {
+        val serviceManager = Class.forName("android.os.ServiceManager")
+        val getService = serviceManager.getDeclaredMethod("getService", String::class.java)
+        val binder = getService.invoke(null, serviceName) as? android.os.IBinder ?: return null
+        val stubClass = Class.forName("android.app.IActivityManager\$Stub")
+        val asInterface = stubClass.getDeclaredMethod("asInterface", android.os.IBinder::class.java)
+        asInterface.invoke(null, binder)
+      }
+    } catch (_: Throwable) {
+      null
+    }
   }
 
   private fun launcherApps(): List<LinkedHashMap<String, Any?>> {
@@ -428,8 +1108,8 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   @Throws(Exception::class)
-  private fun performOnFocusedInput(onFocus: (AccessibilityNodeInfo) -> Unit) {
-    val roots = rootNodes()
+  private fun performOnFocusedInput(displayId: Int, onFocus: (AccessibilityNodeInfo) -> Unit) {
+    val roots = rootNodes(displayId)
     for (root in roots) {
       try {
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
@@ -489,8 +1169,8 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   @Throws(Exception::class)
-  private fun performOnMatchingNode(selector: NodeSelector, onMatch: (AccessibilityNodeInfo) -> Unit): Boolean {
-    val roots = rootNodes()
+  private fun performOnMatchingNode(selector: NodeSelector, displayId: Int, onMatch: (AccessibilityNodeInfo) -> Unit): Boolean {
+    val roots = rootNodes(displayId)
     val state = MatchState()
     for (root in roots) {
       try {
@@ -590,9 +1270,51 @@ class BridgeTest : UiAutomatorTestCase() {
 
   private data class MatchState(var seen: Int = 0)
 
+  private data class DisplayTarget(
+    val displayId: Int,
+    val sessionId: String?,
+    val width: Int,
+    val height: Int
+  )
+
+  private data class DisplaySession(
+    val sessionId: String,
+    val displayId: Int,
+    val virtualDisplay: VirtualDisplay,
+    val imageReader: ImageReader,
+    val width: Int,
+    val height: Int,
+    val dpi: Int,
+    val flags: Int,
+    val createdAtMs: Long,
+    var lastPngBase64: String? = null
+  ) {
+    fun release() {
+      virtualDisplay.release()
+      imageReader.close()
+    }
+  }
+
   companion object {
     private const val SOCKET_NAME = "android-ui-mcp"
     private val DUMP_FILE = File("/sdcard/android-ui-mcp-window.xml")
+
+    private fun virtualDisplayFlags(systemDecorations: Boolean = true, destroyContentOnRemoval: Boolean = true): Int {
+      var flags = (1 shl 0)  // PUBLIC
+        .or(1 shl 1)  // PRESENTATION
+        .or(1 shl 3)  // OWN_CONTENT_ONLY
+        .or(1 shl 6)  // SUPPORTS_TOUCH
+        .or(1 shl 7)  // ROTATES_WITH_CONTENT
+        .or(1 shl 10) // TRUSTED
+        .or(1 shl 11) // OWN_DISPLAY_GROUP
+        .or(1 shl 12) // ALWAYS_UNLOCKED
+        .or(1 shl 13) // TOUCH_FEEDBACK_DISABLED
+        .or(1 shl 14) // OWN_FOCUS
+        .or(1 shl 15) // DEVICE_DISPLAY_GROUP
+      if (destroyContentOnRemoval) flags = flags.or(1 shl 8)
+      if (systemDecorations) flags = flags.or(1 shl 9)
+      return flags
+    }
 
     private data class NodeSelector(
       val text: String? = null,
@@ -671,9 +1393,17 @@ class BridgeTest : UiAutomatorTestCase() {
 
     @Throws(Exception::class)
     private fun readField(target: Any, fieldName: String): Any? {
-      val field = target.javaClass.getDeclaredField(fieldName)
-      field.isAccessible = true
-      return field.get(target)
+      var type: Class<*>? = target.javaClass
+      while (type != null) {
+        try {
+          val field = type.getDeclaredField(fieldName)
+          field.isAccessible = true
+          return field.get(target)
+        } catch (_: NoSuchFieldException) {
+          type = type.superclass
+        }
+      }
+      throw NoSuchFieldException("No field $fieldName in ${target.javaClass.name} hierarchy")
     }
 
     private fun rectToString(rect: Rect): String {
