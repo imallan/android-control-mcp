@@ -237,26 +237,86 @@ class BridgeTest : UiAutomatorTestCase() {
     device.waitForIdle(500)
     val bridge = invokeNoArg(device, "getAutomatorBridge") ?: throw IllegalStateException("missing automator bridge")
     val roots = ArrayList<AccessibilityNodeInfo>()
+    val activeRoot =
+      if (displayId == 0) invokeNoArg(bridge, "getRootInActiveWindow") as AccessibilityNodeInfo?
+      else null
 
-    if (displayId == 0) {
-      val activeRoot = invokeNoArg(bridge, "getRootInActiveWindow") as AccessibilityNodeInfo?
+    if (activeRoot != null) {
+      roots.add(activeRoot)
+    }
+
+    val uiAutomation = readField(bridge, "mUiAutomation")
+    if (uiAutomation == null) {
+      if (activeRoot != null) return roots
+      throw IllegalStateException("missing ui automation")
+    }
+    enableInteractiveWindows(uiAutomation)
+    val windows = try {
+      allAccessibilityWindows(uiAutomation, displayId)
+    } catch (error: Throwable) {
+      // Window enumeration is an enhancement for display 0. Some OEM
+      // UiAutomation implementations do not expose getWindows even after
+      // FLAG_RETRIEVE_INTERACTIVE_WINDOWS is enabled, so retain the active
+      // root rather than failing an otherwise usable compact dump.
+      if (activeRoot != null) return roots
+      throw error
+    }
+
+    try {
       if (activeRoot != null) {
-        roots.add(activeRoot)
+        val activeWindowId = activeRoot.windowId
+        if (activeWindowId == UNDEFINED_WINDOW_ID) {
+          return roots
+        }
+
+        // PopupWindow, PopupMenu, Spinner dropdowns, and anchored dialogs can
+        // live in secondary accessibility windows. Include only windows whose
+        // parent chain reaches the active window. Unrelated top-level windows
+        // from split-screen apps and system UI therefore remain excluded.
+        for (window in windows
+          .asSequence()
+          .filter { it.displayId == displayId && it.id != activeWindowId }
+          .filter { isDescendantWindowOf(it, activeWindowId) }
+          .sortedBy { it.layer }) {
+          window.root?.let { roots.add(it) }
+        }
         return roots
       }
-    }
 
-    val uiAutomation = readField(bridge, "mUiAutomation") ?: throw IllegalStateException("missing ui automation")
-    enableInteractiveWindows(uiAutomation)
-    val windows = allAccessibilityWindows(uiAutomation, displayId)
-    for (window in windows) {
-      if (window.displayId != displayId) continue
-      val root = window.root
-      if (root != null) {
-        roots.add(root)
+      // Preserve the existing fallback when there is no active root, and for
+      // non-default displays where all windows on that display are relevant.
+      for (window in windows) {
+        if (window.displayId != displayId) continue
+        window.root?.let { roots.add(it) }
       }
+      return roots
+    } finally {
+      recycleWindows(windows)
     }
-    return roots
+  }
+
+  private fun isDescendantWindowOf(window: AccessibilityWindowInfo, ancestorWindowId: Int): Boolean {
+    var parent = window.parent
+    var depth = 0
+    while (parent != null && depth < MAX_WINDOW_PARENT_DEPTH) {
+      val parentId = parent.id
+      if (parentId == ancestorWindowId) {
+        parent.recycle()
+        return true
+      }
+      val next = parent.parent
+      parent.recycle()
+      parent = next
+      depth += 1
+    }
+    parent?.recycle()
+    return false
+  }
+
+  private fun recycleWindows(windows: List<AccessibilityWindowInfo>) {
+    for (window in windows) {
+      window.recycle()
+    }
   }
 
   private fun enableInteractiveWindows(uiAutomation: Any) {
@@ -1296,6 +1356,8 @@ class BridgeTest : UiAutomatorTestCase() {
   }
 
   companion object {
+    private const val MAX_WINDOW_PARENT_DEPTH = 32
+    private const val UNDEFINED_WINDOW_ID = -1
     private const val SOCKET_NAME = "android-ui-mcp"
     private val DUMP_FILE = File("/sdcard/android-ui-mcp-window.xml")
 
