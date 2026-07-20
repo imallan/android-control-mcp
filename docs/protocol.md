@@ -22,6 +22,7 @@ Bridge-backed MCP tools:
 - `android_wait_for_ref_gone`
 - `android_wait_for_screen_change`
 - `android_get_semantic_screen`
+- `android_get_ui_outline`
 - `android_dump_tree`
 - `android_dump_compact`
 - `android_tap`
@@ -87,6 +88,18 @@ Semantic nodes may also include:
 - `role`: best-effort role inferred from Android class names, actions, and OCR source.
 - `editable`: whether the node appears to support text editing.
 - `score`: usefulness score for agent selection and default ordering.
+- `depth`, `windowIndex`: compact hierarchy and owning-window position.
+- `collection`, `collectionItem`, `collectionScope`: list/grid structure used for stable-in-snapshot row aliases.
+- `checkable`, `checked`, `focused`, `selected`, `enabled`: relevant accessibility state when exposed.
+
+`android_get_ui_outline` runs the same semantic collection pipeline and creates the
+same cached snapshot, but returns a compact `outline` string instead of the full node
+array. Primary-window nodes are zoned into `[Top]`, `[Content]`, and `[Bottom]`;
+secondary accessibility windows receive their own sections. Lines retain `aN`, `oN`,
+and `vN` refs. Collection items can additionally receive `#N` aliases (or `#N@scope`
+when multiple collections are present); aliases are outline labels, while action tools
+continue to accept the adjacent snapshot ref. `includeEntries` defaults to `false`,
+`includeScreenshot` defaults to `false`, and `maxLines` defaults to `80`.
 
 Action tools that return `currentSnapshot`, including coordinate, ref, and locator taps, support stable snapshot waiting:
 

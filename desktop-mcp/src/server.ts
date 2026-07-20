@@ -43,6 +43,26 @@ type SemanticNode = {
   clickable?: boolean;
   scrollable?: boolean;
   editable?: boolean;
+  checkable?: boolean;
+  checked?: boolean;
+  focused?: boolean;
+  selected?: boolean;
+  enabled?: boolean;
+  depth?: number;
+  windowIndex?: number;
+  collectionScope?: number;
+  collection?: {
+    rowCount: number;
+    columnCount: number;
+    hierarchical?: boolean;
+  };
+  collectionItem?: {
+    rowIndex: number;
+    rowSpan: number;
+    columnIndex: number;
+    columnSpan: number;
+    heading?: boolean;
+  };
   actions?: string[];
   source: "accessibility" | "ocr" | "vision";
   confidence?: number;
@@ -61,6 +81,22 @@ type SemanticSnapshot = {
   height?: number;
   nodes: SemanticNode[];
   nodeCount: number;
+};
+
+type SemanticScreenBuild = {
+  deviceId: string;
+  compact: Record<string, unknown>;
+  snapshot: SemanticSnapshot;
+  screenshot?: ScreenshotResult;
+  tree: { usable: boolean; reason: string };
+  ocrMode: OcrMode;
+  visionMode: OcrMode;
+  shouldRunOcr: boolean;
+  shouldRunVision: boolean;
+  options: ReturnType<typeof ocrOptions>;
+  accessibilityNodeCount: number;
+  ocr?: Awaited<ReturnType<typeof runOcr>>;
+  vision?: Awaited<ReturnType<typeof runVisionDetect>>;
 };
 
 type SnapshotCacheEntry = SemanticSnapshot & {
@@ -1077,14 +1113,49 @@ async function androidOcrScreen(input: unknown): Promise<ToolResult> {
 
 async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   const params = optionalObject(input);
+  const includeScreenshot = optionalBooleanParam(params, "includeScreenshot", true);
+  const includeRawTree = optionalBooleanParam(params, "includeRawTree", false);
+  const includeRawVision = optionalBooleanParam(params, "includeRawVision", false);
+  const built = await buildSemanticScreen(params, includeScreenshot);
+  const { deviceId, compact, snapshot, screenshot, tree, ocrMode, visionMode, shouldRunOcr, shouldRunVision, options, ocr, vision } = built;
+
+  return {
+    ...(includeScreenshot && screenshot ? screenshot : {}),
+    deviceId,
+    displayId: snapshot.displayId,
+    ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}),
+    snapshotId: snapshot.snapshotId,
+    screenSignature: snapshot.screenSignature,
+    actionableSignature: snapshot.actionableSignature,
+    packageName: compact.packageName,
+    width: includeScreenshot && screenshot ? screenshot.width : compact.width,
+    height: includeScreenshot && screenshot ? screenshot.height : compact.height,
+    ocrMode,
+    ocrUsed: shouldRunOcr,
+    ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
+    ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
+    visionMode,
+    visionUsed: shouldRunVision,
+    visionEngine: shouldRunVision ? "apple-vision-detect" : undefined,
+    visionNodeCount: vision?.nodes.length ?? 0,
+    treeUsable: tree.usable,
+    accessibilityNodeCount: built.accessibilityNodeCount,
+    ocrNodeCount: ocr?.nodes.length ?? 0,
+    ocrCached: ocr?.cached ?? false,
+    nodes: snapshot.nodes,
+    nodeCount: snapshot.nodeCount,
+    ...(includeRawTree ? { compactTree: compact } : {}),
+    ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {}),
+    ...(includeRawVision && vision ? { rawVision: vision.rawDetect } : {})
+  };
+}
+
+async function buildSemanticScreen(params: Record<string, unknown>, includeScreenshot: boolean): Promise<SemanticScreenBuild> {
   const deviceId = await deviceIdParam(params);
   const target = displayTargetParams(params);
   const options = ocrOptions(params);
   const ocrMode = optionalEnumParam(params, "ocrMode", ["auto", "force", "off"] as const, "auto");
   const visionMode = optionalEnumParam(params, "visionMode", ["auto", "force", "off"] as const, "auto");
-  const includeScreenshot = optionalBooleanParam(params, "includeScreenshot", true);
-  const includeRawTree = optionalBooleanParam(params, "includeRawTree", false);
-  const includeRawVision = optionalBooleanParam(params, "includeRawVision", false);
 
   const compact = await androidDumpCompact(deviceId, target);
   const accessibilityNodes = compactNodes(compact);
@@ -1109,33 +1180,132 @@ async function androidGetSemanticScreen(input: unknown): Promise<ToolResult> {
   rememberSnapshot(snapshot);
 
   return {
-    ...(includeScreenshot && screenshot ? screenshot : {}),
     deviceId,
-    displayId: snapshot.displayId,
-    ...(snapshot.sessionId ? { sessionId: snapshot.sessionId } : {}),
-    snapshotId: snapshot.snapshotId,
-    screenSignature: snapshot.screenSignature,
-    actionableSignature: snapshot.actionableSignature,
-    packageName: compact.packageName,
-    width: includeScreenshot && screenshot ? screenshot.width : compact.width,
-    height: includeScreenshot && screenshot ? screenshot.height : compact.height,
+    compact,
+    snapshot,
+    screenshot,
+    tree,
     ocrMode,
-    ocrUsed: shouldRunOcr,
-    ocrEngine: shouldRunOcr ? options.ocrEngine : undefined,
-    ocrReason: shouldRunOcr ? (ocrMode === "force" ? "forced" : tree.reason) : "not_needed",
     visionMode,
-    visionUsed: shouldRunVision,
-    visionEngine: shouldRunVision ? "apple-vision-detect" : undefined,
-    visionNodeCount: vision?.nodes.length ?? 0,
-    treeUsable: tree.usable,
+    shouldRunOcr,
+    shouldRunVision,
+    options,
     accessibilityNodeCount: accessibilityNodes.length,
-    ocrNodeCount: ocr?.nodes.length ?? 0,
-    ocrCached: ocr?.cached ?? false,
-    nodes: snapshot.nodes,
-    nodeCount: snapshot.nodeCount,
-    ...(includeRawTree ? { compactTree: compact } : {}),
-    ...(options.includeRawOcr && ocr ? { rawOcr: ocr.rawOcr } : {}),
-    ...(includeRawVision && vision ? { rawVision: vision.rawDetect } : {})
+    ocr,
+    vision
+  };
+}
+
+function renderUiOutline(snapshot: SemanticSnapshot, maxLines: number): { outline: string; entries: Record<string, unknown>[]; lineCount: number; truncated: boolean } {
+  const height = snapshot.height ?? Math.max(1, ...snapshot.nodes.map((node) => node.bounds[3]));
+  const candidates = snapshot.nodes.filter((node) => node.ref && (outlineLabel(node) || isActionableNode(node)));
+  const selected = [...candidates]
+    .sort((a, b) => Number(isActionableNode(b)) - Number(isActionableNode(a)) || (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, maxLines);
+  const scopeCounts = new Map<number, number>();
+  for (const node of selected) {
+    if (node.collectionItem && node.collectionScope !== undefined) {
+      scopeCounts.set(node.collectionScope, (scopeCounts.get(node.collectionScope) ?? 0) + 1);
+    }
+  }
+  const rankedScopes = [...scopeCounts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).map(([scope]) => scope);
+  const scopeRank = new Map(rankedScopes.map((scope, index) => [scope, index + 1]));
+  const entries = selected.map((node) => outlineEntry(node, height, scopeRank));
+  const sections = new Map<string, Record<string, unknown>[]>();
+  for (const entry of entries) {
+    const region = entry.region as string;
+    const values = sections.get(region) ?? [];
+    values.push(entry);
+    sections.set(region, values);
+  }
+  for (const values of sections.values()) {
+    values.sort((a, b) => {
+      const ab = a.bounds as Bounds;
+      const bb = b.bounds as Bounds;
+      return ab[1] - bb[1] || ab[0] - bb[0];
+    });
+  }
+  const secondary = [...sections.keys()].filter((name) => name.startsWith("Window ")).sort((a, b) => Number(b.slice(7)) - Number(a.slice(7)));
+  const order = [...secondary, "Top", "Content", "Bottom"];
+  const lines: string[] = [];
+  for (const region of order) {
+    const values = sections.get(region);
+    if (!values?.length) continue;
+    lines.push(`[${region}]`);
+    for (const entry of values) {
+      const states = entry.states as string[];
+      lines.push(`  ${entry.ref}${entry.alias ? ` ${entry.alias}` : ""} ${entry.role} \"${escapeOutlineLabel(entry.label as string)}\"${states.length ? ` [${states.join(",")}]` : ""}`);
+    }
+  }
+  return { outline: lines.join("\n"), entries, lineCount: selected.length, truncated: candidates.length > selected.length };
+}
+
+function outlineEntry(node: SemanticNode, height: number, scopeRank: Map<number, number>): Record<string, unknown> {
+  const windowIndex = node.windowIndex ?? 0;
+  const region = windowIndex > 0 ? `Window ${windowIndex + 1}` : node.center[1] < height * 0.18 ? "Top" : node.center[1] > height * 0.82 ? "Bottom" : "Content";
+  const scope = node.collectionScope === undefined ? undefined : scopeRank.get(node.collectionScope);
+  const row = node.collectionItem ? node.collectionItem.rowIndex + 1 : undefined;
+  const alias = row === undefined || scope === undefined ? undefined : scope === 1 ? `#${row}` : `#${row}@${scope}`;
+  const states: string[] = [];
+  if (node.editable) states.push("editable");
+  if (node.checkable) states.push(node.checked ? "checked" : "unchecked");
+  if (node.selected) states.push("selected");
+  if (node.focused) states.push("focused");
+  if (node.enabled === false) states.push("disabled");
+  if (node.clickable && node.role !== "button") states.push("clickable");
+  if (node.scrollable) states.push("scrollable");
+  return {
+    ref: node.ref,
+    ...(alias ? { alias } : {}),
+    role: node.role ?? "element",
+    label: outlineLabel(node) || "unlabeled",
+    states,
+    region,
+    bounds: node.bounds,
+    source: node.source
+  };
+}
+
+function outlineLabel(node: SemanticNode): string {
+  const resourceLabel = node.resourceId?.split("/").at(-1)?.replaceAll("_", " ");
+  return truncate((node.text ?? node.contentDesc ?? resourceLabel ?? node.role ?? "").replace(/\s+/g, " ").trim(), 80);
+}
+
+function escapeOutlineLabel(label: string): string {
+  return label.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("\n", " ");
+}
+
+function isActionableNode(node: SemanticNode): boolean {
+  return node.clickable === true || node.scrollable === true || node.editable === true || (node.actions?.length ?? 0) > 0;
+}
+
+async function androidGetUiOutline(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const includeScreenshot = optionalBooleanParam(params, "includeScreenshot", false);
+  const includeEntries = optionalBooleanParam(params, "includeEntries", false);
+  const maxLines = Math.min(500, Math.max(1, optionalIntegerParam(params, "maxLines", 80)));
+  const built = await buildSemanticScreen(params, includeScreenshot);
+  const rendered = renderUiOutline(built.snapshot, maxLines);
+  return {
+    ...(includeScreenshot && built.screenshot ? built.screenshot : {}),
+    success: true,
+    deviceId: built.deviceId,
+    displayId: built.snapshot.displayId,
+    ...(built.snapshot.sessionId ? { sessionId: built.snapshot.sessionId } : {}),
+    snapshotId: built.snapshot.snapshotId,
+    screenSignature: built.snapshot.screenSignature,
+    actionableSignature: built.snapshot.actionableSignature,
+    packageName: built.snapshot.packageName,
+    width: built.snapshot.width,
+    height: built.snapshot.height,
+    outline: rendered.outline,
+    lineCount: rendered.lineCount,
+    nodeCount: built.snapshot.nodeCount,
+    truncated: rendered.truncated,
+    treeUsable: built.tree.usable,
+    ocrUsed: built.shouldRunOcr,
+    visionUsed: built.shouldRunVision,
+    ...(includeEntries ? { entries: rendered.entries } : {})
   };
 }
 
@@ -1560,6 +1730,8 @@ function compactNodes(compact: Record<string, unknown>): SemanticNode[] {
     const resourceId = optionalStringParam(node, "resourceId");
     const className = optionalStringParam(node, "className");
     const actions = Array.isArray(node.actions) ? node.actions.filter((action): action is string => typeof action === "string") : undefined;
+    const collection = optionalCompactCollection(node.collection);
+    const collectionItem = optionalCompactCollectionItem(node.collectionItem);
     nodes.push({
       id: `accessibility:${index + 1}`,
       ...(text ? { text: truncate(text, 80) } : {}),
@@ -1570,11 +1742,45 @@ function compactNodes(compact: Record<string, unknown>): SemanticNode[] {
       center: boundsCenter(bounds),
       ...(node.clickable === true ? { clickable: true } : {}),
       ...(node.scrollable === true ? { scrollable: true } : {}),
+      ...(node.checkable === true ? { checkable: true } : {}),
+      ...(typeof node.checked === "boolean" ? { checked: node.checked } : {}),
+      ...(node.focused === true ? { focused: true } : {}),
+      ...(node.selected === true ? { selected: true } : {}),
+      ...(typeof node.enabled === "boolean" ? { enabled: node.enabled } : {}),
+      ...(typeof node.depth === "number" ? { depth: node.depth } : {}),
+      ...(typeof node.windowIndex === "number" ? { windowIndex: node.windowIndex } : {}),
+      ...(typeof node.collectionScope === "number" ? { collectionScope: node.collectionScope } : {}),
+      ...(collection ? { collection } : {}),
+      ...(collectionItem ? { collectionItem } : {}),
       ...(actions && actions.length > 0 ? { actions } : {}),
       source: "accessibility"
     });
   }
   return nodes;
+}
+
+function optionalCompactCollection(value: unknown): SemanticNode["collection"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.rowCount !== "number" || typeof raw.columnCount !== "number") return undefined;
+  return {
+    rowCount: raw.rowCount,
+    columnCount: raw.columnCount,
+    ...(typeof raw.hierarchical === "boolean" ? { hierarchical: raw.hierarchical } : {})
+  };
+}
+
+function optionalCompactCollectionItem(value: unknown): SemanticNode["collectionItem"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (![raw.rowIndex, raw.rowSpan, raw.columnIndex, raw.columnSpan].every((part) => typeof part === "number")) return undefined;
+  return {
+    rowIndex: raw.rowIndex as number,
+    rowSpan: raw.rowSpan as number,
+    columnIndex: raw.columnIndex as number,
+    columnSpan: raw.columnSpan as number,
+    ...(typeof raw.heading === "boolean" ? { heading: raw.heading } : {})
+  };
 }
 
 function assessTreeUsability(compact: Record<string, unknown>, nodes: SemanticNode[]): { usable: boolean; reason: string } {
@@ -3569,6 +3775,25 @@ const tools: ToolDefinition[] = [
     handler: androidGetSemanticScreen
   },
   {
+    name: "android_get_ui_outline",
+    description: "Return a token-efficient zoned UI outline with the same snapshot-local refs used by semantic actions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProperties,
+        ...displayTargetProperties,
+        ocrMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
+        visionMode: { type: "string", enum: ["auto", "force", "off"], default: "auto", description: "Visual icon/button detection mode. auto: run when accessibility is sparse. force: always run. off: never run." },
+        includeScreenshot: { type: "boolean", default: false },
+        includeEntries: { type: "boolean", default: false, description: "Also return structured entries. Omit for the smallest response." },
+        maxLines: { type: "integer", minimum: 1, maximum: 500, default: 80 },
+        ...ocrCommonProperties
+      },
+      additionalProperties: false
+    },
+    handler: androidGetUiOutline
+  },
+  {
     name: "android_dump_tree",
     description: "Dump the current Android accessibility tree as XML through the persistent on-device UIAutomator bridge.",
     inputSchema: { type: "object", properties: { ...deviceProperties, ...displayTargetProperties }, additionalProperties: false },
@@ -4052,6 +4277,9 @@ export const __test = {
   bridgeRpcOnSocket,
   rankSemanticNodes,
   mergeSemanticNodes,
+  compactNodes,
+  renderUiOutline,
+  toolDefinition: (name: string) => toolMap.get(name),
   relocateAccessibilityNode,
   afterConditions,
   capabilityGroupForTool,

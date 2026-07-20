@@ -45,6 +45,8 @@ try {
   const traceTools = await request("tools/list", { capabilities: ["trace"] });
   assert.ok(traceTools.result.tools.some((item) => item.name === "android_trace_start"));
   assert.ok(traceTools.result.tools.every((item) => item.name === "android_capabilities" || item._meta["android-ui-mcp/capabilityGroup"] === "trace"));
+  const coreTools = await request("tools/list", { capabilities: ["core"] });
+  assert.ok(coreTools.result.tools.some((item) => item.name === "android_get_ui_outline"));
   const trace = await tool("android_trace_start", { traceId: `e2e-${Date.now()}` });
   const physical = await tool("android_screenshot", {});
   assert.equal(physical.displayId, 0);
@@ -93,6 +95,20 @@ try {
   });
   assert.equal(semantic.sessionId, sessionId);
   assert.ok(semantic.accessibilityNodeCount > 0);
+  const outline = await tool("android_get_ui_outline", {
+    sessionId,
+    ocrMode: "off",
+    visionMode: "off"
+  });
+  assert.equal(outline.screenSignature, semantic.screenSignature);
+  assert.equal(Object.hasOwn(outline, "imagePath"), false);
+  assert.equal(Object.hasOwn(outline, "entries"), false);
+  assert.ok(JSON.stringify(outline).length <= JSON.stringify(semantic).length * 0.5);
+  const outlineRefs = new Set(outline.outline.split("\n").map((line) => line.trim().split(" ")[0]));
+  const actionableRefs = semantic.nodes
+    .filter((node) => node.source === "accessibility" && (node.clickable || node.scrollable || node.editable || node.actions?.length))
+    .map((node) => node.ref);
+  assert.deepEqual(actionableRefs.filter((ref) => !outlineRefs.has(ref)), []);
   const search = semantic.nodes.find((node) => node.resourceId === "com.android.settings:id/search_action_bar");
   assert.ok(search?.ref);
 

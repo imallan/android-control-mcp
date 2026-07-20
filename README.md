@@ -36,6 +36,8 @@ display remains display `0` when no target is supplied.
 The server also supports local sanitized traces, capability-group filtering,
 post-action wait conditions, cached OCR, ref-disappearance waits, and Android system
 workflow helpers for notifications, Quick Settings, keyboard, permissions, and recents.
+For token-efficient agent observation, `android_get_ui_outline` returns a zoned text
+outline while preserving the same snapshot-local refs used by semantic actions.
 
 The MCP server has no npm dependencies; it runs directly on Node 24's TypeScript support. It can start with no Android device connected. When a device-backed tool is called, the server discovers connected devices and starts the on-device UIAutomator bridge automatically.
 

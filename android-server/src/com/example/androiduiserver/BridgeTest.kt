@@ -204,9 +204,10 @@ class BridgeTest : UiAutomatorTestCase() {
     val roots = rootNodes(target.displayId)
     val packageNames = roots.mapNotNull { root -> root.packageName?.toString()?.takeIf { it.isNotBlank() } }.distinct()
     val packageName = packageNames.firstOrNull { it != "com.android.systemui" } ?: packageNames.firstOrNull().orEmpty()
-    for (root in roots) {
+    val collectionCounter = intArrayOf(0)
+    for ((windowIndex, root) in roots.withIndex()) {
       try {
-        collectCompactNodes(root, nodes, 0)
+        collectCompactNodes(root, nodes, 0, windowIndex, null, collectionCounter)
       } finally {
         root.recycle()
       }
@@ -1382,7 +1383,14 @@ class BridgeTest : UiAutomatorTestCase() {
       }
     }
 
-    private fun collectCompactNodes(node: AccessibilityNodeInfo?, out: MutableList<Any>, depth: Int) {
+    private fun collectCompactNodes(
+      node: AccessibilityNodeInfo?,
+      out: MutableList<Any>,
+      depth: Int,
+      windowIndex: Int,
+      inheritedCollectionScope: Int?,
+      collectionCounter: IntArray
+    ) {
       if (node == null || depth > 80) {
         return
       }
@@ -1391,10 +1399,19 @@ class BridgeTest : UiAutomatorTestCase() {
       val contentDesc = node.contentDescription?.toString().orEmpty()
       val actions = node.actionList
         .mapNotNull { action -> actionLabel(action.id, action.label?.toString()) }
+      val collectionInfo = node.collectionInfo
+      val collectionItemInfo = node.collectionItemInfo
+      val collectionScope = if (collectionInfo != null) {
+        collectionCounter[0] += 1
+        collectionCounter[0]
+      } else {
+        inheritedCollectionScope
+      }
       val hasReadableText = text.isNotEmpty() || contentDesc.isNotEmpty()
       val hasAction = node.isClickable || node.isScrollable || actions.isNotEmpty()
+      val hasStructure = collectionInfo != null || collectionItemInfo != null
 
-      if (hasReadableText || hasAction) {
+      if (hasReadableText || hasAction || hasStructure) {
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         val compact = LinkedHashMap<String, Any?>()
@@ -1403,8 +1420,34 @@ class BridgeTest : UiAutomatorTestCase() {
         putIfPresent(compact, "resourceId", node.viewIdResourceName)
         putIfPresent(compact, "className", node.className?.toString())
         compact["bounds"] = rectToString(bounds)
+        compact["depth"] = depth
+        compact["windowIndex"] = windowIndex
+        if (collectionScope != null) compact["collectionScope"] = collectionScope
         if (node.isClickable) compact["clickable"] = true
         if (node.isScrollable) compact["scrollable"] = true
+        if (node.isCheckable) {
+          compact["checkable"] = true
+          compact["checked"] = node.isChecked
+        }
+        if (node.isFocused) compact["focused"] = true
+        if (node.isSelected) compact["selected"] = true
+        if (!node.isEnabled) compact["enabled"] = false
+        if (collectionInfo != null) {
+          compact["collection"] = linkedMapOf(
+            "rowCount" to collectionInfo.rowCount,
+            "columnCount" to collectionInfo.columnCount,
+            "hierarchical" to collectionInfo.isHierarchical
+          )
+        }
+        if (collectionItemInfo != null) {
+          compact["collectionItem"] = linkedMapOf(
+            "rowIndex" to collectionItemInfo.rowIndex,
+            "rowSpan" to collectionItemInfo.rowSpan,
+            "columnIndex" to collectionItemInfo.columnIndex,
+            "columnSpan" to collectionItemInfo.columnSpan,
+            "heading" to collectionItemInfo.isHeading
+          )
+        }
         if (actions.isNotEmpty()) {
           compact["actions"] = actions
         }
@@ -1416,7 +1459,7 @@ class BridgeTest : UiAutomatorTestCase() {
         val child = node.getChild(index)
         if (child != null) {
           try {
-            collectCompactNodes(child, out, depth + 1)
+            collectCompactNodes(child, out, depth + 1, windowIndex, collectionScope, collectionCounter)
           } finally {
             child.recycle()
           }

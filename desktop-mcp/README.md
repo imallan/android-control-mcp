@@ -17,6 +17,7 @@ on-device bridge, exposed over MCP stdio:
 - `android_screenshot`: overwrites one stable temp file by default; pass `retain=true` to keep a unique screenshot
 - `android_ocr_screen`: run local OCR on the current screenshot and return compact OCR nodes
 - `android_get_semantic_screen`: return accessibility nodes with automatic or forced OCR fallback
+- `android_get_ui_outline`: return a compact `[Top]`/`[Content]`/`[Bottom]` outline using the same snapshot refs
 - `android_dump_tree`: XML hierarchy from the on-device bridge
 - `android_dump_compact`: compact node list from the on-device bridge
 - `android_tap`
@@ -120,12 +121,12 @@ Restart or reload Codex after installation so it discovers the tools.
 ## Transport Notes
 
 - `android_current_app`, `android_wait_for_package`, `android_wait_for_text`, `android_wait_for_screen_change`, `android_dump_tree`, `android_dump_compact`, `android_tap`, `android_tap_ref`, `android_fill_ref`, `android_long_press_ref`, `android_perform_action_ref`, `android_tap_text`, `android_tap_content_desc`, `android_click`, `android_fill_near_label`, `android_swipe`, `android_input_text`, `android_perform_action`, `android_long_press`, `android_key`, `android_go_home`, `android_list_apps`, and `android_launch_app` require the persistent Android bridge.
-- `android_get_semantic_screen` requires both screenshot capture and the persistent Android bridge.
+- `android_get_semantic_screen` and `android_get_ui_outline` require the persistent Android bridge and capture a screenshot only when requested or needed for OCR/vision fallback.
 - Bridge-backed tools start the on-device bridge automatically for the selected `deviceId`; if multiple authorized devices are connected and no default is set, pass `deviceId`.
 - Coordinate, ref, and locator action tools default to returning a post-action snapshot after waiting up to 1500 ms for strict or actionable accessibility stability.
 - `android_perform_action` and `android_perform_action_ref` accept predefined accessibility action names or custom action labels exposed by the target node.
 - `android_screenshot` and `android_ocr_screen` use direct ADB capture for display 0 and bridge-owned ImageReader capture for virtual displays.
-- `android_ocr_screen` and OCR fallback in `android_get_semantic_screen` support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
+- `android_ocr_screen` and OCR fallback in the semantic-screen/outline tools support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
 - OCR results use a bounded content-and-parameter LRU and report `ocrCached`.
 - Mutating tools accept `after.waitForText` and/or `after.waitForPackage` postconditions.
 - The Apple Vision engine is the default OCR backend on this MCP.

@@ -65,8 +65,13 @@ ADB-backed tools:
 Hybrid tools:
 
 - `android_get_semantic_screen`
+- `android_get_ui_outline`
 
 `android_get_semantic_screen` uses both screenshot capture and the bridge-backed compact tree. It can run OCR automatically when the accessibility tree is sparse.
+
+`android_get_ui_outline` reuses that semantic pipeline and snapshot cache, but defaults
+to a compact zoned text response with actionable refs and no screenshot. Pass
+`includeEntries: true` only when structured outline entries are needed.
 
 ## Core Implementation
 

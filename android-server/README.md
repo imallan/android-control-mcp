@@ -146,7 +146,9 @@ Supported methods:
 
 This removes repeated `adb shell` process startup and avoids writing dumps to
 `/sdcard/window.xml`. `dumpCompact` directly traverses `AccessibilityNodeInfo` inside the
-same persistent UIAutomator process and returns only compact node fields.
+same persistent UIAutomator process and returns only compact node fields. Alongside the
+existing text, bounds, and action data, nodes expose additive depth/window, collection,
+collection-item, and relevant accessibility-state metadata for compact UI outlines.
 
 `dumpXml` is kept only as a compatibility/debug method. It still uses
 `UiDevice.dumpWindowHierarchy`, so it is slower and less reliable on modern Android builds
