@@ -1281,6 +1281,7 @@ function outlineEntry(node: SemanticNode, height: number, scopeRank: Map<number,
     bounds: node.bounds,
     source: node.source,
     windowIndex,
+    depth: node.depth ?? 0,
     actionable: isActionableNode(node)
   };
 }

@@ -73,7 +73,7 @@ async function handleViewerRequest(
 ): Promise<void> {
   try {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    if (request.method === "GET" && ["/", "/app.js", "/styles.css"].includes(url.pathname)) {
+    if (request.method === "GET" && ["/", "/app.js", "/hit-test.js", "/styles.css"].includes(url.pathname)) {
       const fileName = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
       const contentType = fileName.endsWith(".html") ? "text/html; charset=utf-8" : fileName.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";
       sendStatic(response, await readFile(join(staticRoot, fileName)), contentType);

@@ -5,14 +5,14 @@
   "type": "module",
   "description": "MCP server for Android UI automation through a persistent on-device bridge.",
   "scripts": {
-    "build": "node --check src/server.ts && node --check src/viewer.ts && node --check viewer/app.js",
-    "test": "node --test test/headless-virtual-display.test.mjs test/semantic-contract.test.mjs",
+    "build": "node --check src/server.ts && node --check src/viewer.ts && node --check viewer/app.js && node --check viewer/hit-test.js",
+    "test": "node --test test/headless-virtual-display.test.mjs test/semantic-contract.test.mjs test/viewer-hit-test.test.mjs",
     "test:fake-bridge": "node --test test/fake-bridge.test.mjs",
     "test:viewer": "node --test test/viewer-http.test.mjs",
     "test:headless": "node test/headless-virtual-display.e2e.mjs",
     "start": "node src/server.ts",
     "dev": "node src/server.ts",
-    "typecheck": "node --check src/server.ts && node --check src/viewer.ts && node --check viewer/app.js"
+    "typecheck": "node --check src/server.ts && node --check src/viewer.ts && node --check viewer/app.js && node --check viewer/hit-test.js"
   },
   "engines": {
     "node": ">=24"

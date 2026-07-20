@@ -116,6 +116,11 @@ action mode, `/api/tap` accepts only a cached `snapshotId` plus an `aN` accessib
 ref and delegates to the existing safe ref resolver. `oN` and `vN` refs are rejected.
 Only one companion Viewer can run per MCP process.
 
+Outline entries used by the Viewer include additive `depth`, `windowIndex`, and
+`actionable` fields. The frontend performs deterministic coordinate hit-testing for
+overlapping bounds rather than relying on SVG paint order; this affects selection only
+and does not change snapshot or action protocol semantics.
+
 Action tools that return `currentSnapshot`, including coordinate, ref, and locator taps, support stable snapshot waiting:
 
 - `returnSnapshot`: include post-action context, default `true`.

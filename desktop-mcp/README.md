@@ -66,6 +66,12 @@ details, Outline text, source filters, manual refresh, and optional one-second l
 refresh. It binds only `127.0.0.1`, protects every API with a random bearer token,
 and defaults to read-only mode.
 
+Overlay selection uses coordinate hit-testing instead of SVG paint order. When several
+nodes cover the same point, the Viewer prioritizes secondary windows, actionable
+targets, accessibility source, deeper nodes, and smaller bounds. The detail panel lists
+the complete overlap stack; click the same point again or use `[` and `]` to cycle
+layers. Selecting one layer dims the remaining boxes.
+
 When `allowActions` is true, an explicit Tap button is shown only for actionable
 accessibility `aN` refs. The backend executes the existing safe
 `snapshotId + ref` action path; OCR and vision refs remain observation-only. Use

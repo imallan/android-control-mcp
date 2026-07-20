@@ -79,6 +79,10 @@ queue, snapshot cache, and safe ref actions. It is loopback-only, bearer-token
 protected, read-only by default, and exposes OCR/vision nodes for inspection without
 making them action targets.
 
+Overlapping Viewer elements are selected through coordinate hit-testing with a ranked
+layer chooser. Repeated clicks and the `[`/`]` keys cycle the stack, so large root or
+scrollable bounds no longer automatically capture selection.
+
 ## Core Implementation
 
 Main desktop implementation:

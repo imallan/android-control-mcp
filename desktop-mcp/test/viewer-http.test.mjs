@@ -30,6 +30,7 @@ test("Viewer HTTP server protects APIs and rejects non-accessibility taps", asyn
     assert.equal(page.status, 200);
     assert.match(page.headers.get("content-security-policy"), /connect-src 'self'/);
     assert.match(await page.text(), /Android MCP Viewer/);
+    assert.equal((await fetch(`${base}/hit-test.js`)).status, 200);
 
     assert.equal((await fetch(`${base}/api/status`)).status, 401);
     assert.deepEqual(await (await fetch(`${base}/api/status`, { headers })).json(), { status: "viewer_running" });

@@ -1,5 +1,7 @@
+import { cycleIndex, hitCandidates, sameHit } from "./hit-test.js";
+
 const token = new URLSearchParams(location.hash.slice(1)).get("token") ?? "";
-const state = { snapshot: null, frameUrl: null, selectedRef: null, refreshing: false, timer: null };
+const state = { snapshot: null, frameUrl: null, selectedRef: null, refreshing: false, timer: null, hit: null };
 const colors = { accessibility: "#43d9a3", ocr: "#ffbf4b", vision: "#ba8cff" };
 const screen = document.querySelector("#screen");
 const overlay = document.querySelector("#overlay");
@@ -37,15 +39,25 @@ async function refresh() {
 }
 
 async function applySnapshot(snapshot) {
-    state.snapshot = snapshot;
-    const frame = await api(`/api/frame?snapshotId=${encodeURIComponent(state.snapshot.snapshotId)}`);
-    if (state.frameUrl) URL.revokeObjectURL(state.frameUrl);
-    state.frameUrl = URL.createObjectURL(await frame.blob());
-    screen.src = state.frameUrl;
-    outline.textContent = state.snapshot.outline;
-    summary.textContent = `${state.snapshot.deviceId} · ${state.snapshot.packageName ?? "unknown package"} · display ${state.snapshot.displayId} · ${state.snapshot.snapshotId}`;
-    renderOverlay();
-    renderDetail();
+  const previousSignature = state.snapshot?.screenSignature;
+  state.snapshot = snapshot;
+  if (previousSignature !== snapshot.screenSignature) {
+    state.selectedRef = null;
+    state.hit = null;
+  } else if (state.hit) {
+    state.hit.candidates = state.hit.candidates
+      .map((oldEntry) => snapshot.entries.find((entry) => entry.ref === oldEntry.ref))
+      .filter(Boolean);
+    state.hit.index = Math.min(state.hit.index, Math.max(0, state.hit.candidates.length - 1));
+  }
+  const frame = await api(`/api/frame?snapshotId=${encodeURIComponent(state.snapshot.snapshotId)}`);
+  if (state.frameUrl) URL.revokeObjectURL(state.frameUrl);
+  state.frameUrl = URL.createObjectURL(await frame.blob());
+  screen.src = state.frameUrl;
+  outline.textContent = state.snapshot.outline;
+  summary.textContent = `${state.snapshot.deviceId} · ${state.snapshot.packageName ?? "unknown package"} · display ${state.snapshot.displayId} · ${state.snapshot.snapshotId}`;
+  renderOverlay();
+  renderDetail();
 }
 
 function visibleEntries() {
@@ -58,6 +70,7 @@ function visibleEntries() {
 function renderOverlay() {
   if (!state.snapshot) return;
   overlay.setAttribute("viewBox", `0 0 ${state.snapshot.width} ${state.snapshot.height}`);
+  overlay.classList.toggle("has-selection", Boolean(state.selectedRef));
   overlay.replaceChildren(...visibleEntries().map((entry) => {
     const [left, top, right, bottom] = entry.bounds;
     const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
@@ -67,22 +80,65 @@ function renderOverlay() {
     rect.setAttribute("height", Math.max(1, bottom - top));
     rect.setAttribute("class", `node${entry.windowIndex > 0 ? " secondary" : ""}${entry.ref === state.selectedRef ? " selected" : ""}`);
     rect.style.setProperty("--node-color", colors[entry.source]);
-    rect.dataset.ref = entry.ref;
-    rect.addEventListener("click", () => { state.selectedRef = entry.ref; renderOverlay(); renderDetail(); });
     return rect;
   }));
+}
+
+function selectAtPoint(event) {
+  if (!state.snapshot) return;
+  const box = overlay.getBoundingClientRect();
+  const point = {
+    x: (event.clientX - box.left) * state.snapshot.width / box.width,
+    y: (event.clientY - box.top) * state.snapshot.height / box.height
+  };
+  const candidates = hitCandidates(visibleEntries(), point);
+  if (candidates.length === 0) {
+    state.hit = null;
+    state.selectedRef = null;
+    renderOverlay();
+    renderDetail();
+    setNotice("No visible semantic element at this point.");
+    return;
+  }
+  const repeated = sameHit(state.hit, point, candidates);
+  const index = repeated ? cycleIndex(state.hit.index, candidates.length) : 0;
+  state.hit = { point, candidates, index };
+  state.selectedRef = candidates[index].ref;
+  renderOverlay();
+  renderDetail();
+  setNotice(candidates.length > 1
+    ? `${candidates.length} overlapping elements · selected ${index + 1}/${candidates.length} · click again or use [ ] to cycle`
+    : `Selected ${state.selectedRef}`);
+}
+
+function selectLayer(index) {
+  if (!state.hit?.candidates[index]) return;
+  state.hit.index = index;
+  state.selectedRef = state.hit.candidates[index].ref;
+  renderOverlay();
+  renderDetail();
+  setNotice(`${state.hit.candidates.length} overlapping elements · selected ${index + 1}/${state.hit.candidates.length}`);
+}
+
+function cycleLayer(direction) {
+  if (!state.hit?.candidates.length) return;
+  selectLayer(cycleIndex(state.hit.index, state.hit.candidates.length, direction));
 }
 
 function renderDetail() {
   const entry = state.snapshot?.entries.find((item) => item.ref === state.selectedRef);
   if (!entry) {
-    detail.innerHTML = "<p>Select a box to inspect it.</p>";
+    detail.innerHTML = "<p>Click the screenshot to inspect an element.</p>";
     return;
   }
+  const layers = state.hit?.candidates.length > 1
+    ? `<div class="layer-heading"><strong>${state.hit.candidates.length} layers here</strong><span>click again or use [ ]</span></div><div class="layer-list">${state.hit.candidates.map((candidate, index) => `<button type="button" class="layer-option${candidate.ref === entry.ref ? " active" : ""}" data-layer-index="${index}"><span>${escapeHtml(candidate.ref)}</span><span>${escapeHtml(candidate.role)}</span><span>${escapeHtml(candidate.label)}</span><small>${candidate.source} · d${candidate.depth}${candidate.actionable ? " · action" : ""}</small></button>`).join("")}</div>`
+    : "";
   const actionButton = state.snapshot.allowActions && entry.source === "accessibility" && entry.actionable
     ? `<button id="tap" type="button">Tap ${escapeHtml(entry.ref)}</button>`
     : "";
-  detail.innerHTML = `<dl><dt>ref</dt><dd>${escapeHtml(entry.ref)}</dd><dt>label</dt><dd>${escapeHtml(entry.label)}</dd><dt>role</dt><dd>${escapeHtml(entry.role)}</dd><dt>source</dt><dd>${escapeHtml(entry.source)}</dd><dt>bounds</dt><dd>${escapeHtml(JSON.stringify(entry.bounds))}</dd><dt>window</dt><dd>${entry.windowIndex}</dd><dt>states</dt><dd>${escapeHtml(entry.states.join(", ") || "—")}</dd></dl>${actionButton}`;
+  detail.innerHTML = `${layers}<dl><dt>ref</dt><dd>${escapeHtml(entry.ref)}</dd><dt>label</dt><dd>${escapeHtml(entry.label)}</dd><dt>role</dt><dd>${escapeHtml(entry.role)}</dd><dt>source</dt><dd>${escapeHtml(entry.source)}</dd><dt>bounds</dt><dd>${escapeHtml(JSON.stringify(entry.bounds))}</dd><dt>window</dt><dd>${entry.windowIndex}</dd><dt>depth</dt><dd>${entry.depth}</dd><dt>states</dt><dd>${escapeHtml(entry.states.join(", ") || "—")}</dd></dl>${actionButton}`;
+  document.querySelectorAll("[data-layer-index]").forEach((button) => button.addEventListener("click", () => selectLayer(Number(button.dataset.layerIndex))));
   document.querySelector("#tap")?.addEventListener("click", () => tap(entry));
 }
 
@@ -109,7 +165,26 @@ function escapeHtml(value) {
 }
 
 refreshButton.addEventListener("click", refresh);
-document.querySelectorAll(".filters input").forEach((input) => input.addEventListener("change", renderOverlay));
+overlay.addEventListener("click", selectAtPoint);
+document.querySelectorAll(".filters input").forEach((input) => input.addEventListener("change", () => {
+  const visible = visibleEntries();
+  const visibleRefs = new Set(visible.map((entry) => entry.ref));
+  if (state.hit) {
+    state.hit.candidates = state.hit.candidates.filter((entry) => visibleRefs.has(entry.ref));
+    state.hit.index = state.hit.candidates.findIndex((entry) => entry.ref === state.selectedRef);
+  }
+  if (state.selectedRef && !visibleRefs.has(state.selectedRef)) {
+    state.selectedRef = null;
+    state.hit = null;
+  }
+  renderOverlay();
+  renderDetail();
+}));
+document.addEventListener("keydown", (event) => {
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLButtonElement) return;
+  if (event.key === "[") cycleLayer(-1);
+  if (event.key === "]") cycleLayer(1);
+});
 live.addEventListener("change", () => {
   clearInterval(state.timer);
   state.timer = live.checked ? setInterval(() => { if (!document.hidden) refresh(); }, 1000) : null;
