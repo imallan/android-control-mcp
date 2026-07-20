@@ -276,7 +276,16 @@ class BridgeTest : UiAutomatorTestCase() {
         for (window in windows
           .asSequence()
           .filter { it.displayId == displayId && it.id != activeWindowId }
-          .filter { isDescendantWindowOf(it, activeWindowId) }
+          .filter { window ->
+            isWindowInActiveHierarchy(
+              window = window,
+              activeWindowId = activeWindowId,
+              maxParentDepth = MAX_WINDOW_PARENT_DEPTH,
+              idOf = { it.id },
+              parentOf = { it.parent },
+              release = { it.recycle() }
+            )
+          }
           .sortedBy { it.layer }) {
           window.root?.let { roots.add(it) }
         }
@@ -293,24 +302,6 @@ class BridgeTest : UiAutomatorTestCase() {
     } finally {
       recycleWindows(windows)
     }
-  }
-
-  private fun isDescendantWindowOf(window: AccessibilityWindowInfo, ancestorWindowId: Int): Boolean {
-    var parent = window.parent
-    var depth = 0
-    while (parent != null && depth < MAX_WINDOW_PARENT_DEPTH) {
-      val parentId = parent.id
-      if (parentId == ancestorWindowId) {
-        parent.recycle()
-        return true
-      }
-      val next = parent.parent
-      parent.recycle()
-      parent = next
-      depth += 1
-    }
-    parent?.recycle()
-    return false
   }
 
   private fun recycleWindows(windows: List<AccessibilityWindowInfo>) {

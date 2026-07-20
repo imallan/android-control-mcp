@@ -25,6 +25,13 @@ The script delegates to the repository Gradle wrapper:
 ./gradlew :android-server:buildUiautomatorJar
 ```
 
+The build runs the host-side accessibility-window ownership regression test.
+Run that test by itself with:
+
+```sh
+./gradlew :android-server:testWindowHierarchy
+```
+
 The Gradle task uses the local Android SDK directly, but it now auto-discovers the latest
 installed platform/build-tools when environment variables are not set.
 

@@ -191,6 +191,19 @@ Latest hardening checks on 2026-07-12:
 - `npm run test:headless` passes API 37 default/virtual display, OCR cache miss/hit, post-action waits, ref-gone, trace, capability filtering, all system workflow helpers, a real Camera runtime-permission dialog grant, and Camera weak-accessibility OCR/vision fallback.
 - `./gradlew :android-server:buildUiautomatorJar` and `npm run build` pass.
 
+Latest default-display multi-window checks on 2026-07-20:
+
+- Compact snapshots now keep the active window and merge only secondary windows whose
+  accessibility parent chain reaches it; unrelated top-level split-screen/System UI
+  windows remain excluded.
+- A Pixel API 37 Emulator test used a deterministic `focusable=false` PopupWindow.
+  The baseline activity returned 8 nodes; with the popup visible it returned the same
+  8 activity nodes plus `Secondary popup` as node 9, confirming the parent-chain merge.
+- Modal Launcher and Clock menus correctly became the active root and returned only
+  their actionable menu contents instead of the obscured activity behind them.
+- `testWindowHierarchy` covers active, direct/transitive child, unrelated top-level,
+  cyclic parent, and maximum-parent-depth behavior on the host JVM.
+
 ## New Session Test Plan
 
 Use this section when opening a fresh Codex App session after MCP tool discovery reloads.

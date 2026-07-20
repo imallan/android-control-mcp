@@ -128,6 +128,7 @@ val classesDir = layout.buildDirectory.dir("classes")
 val dexDir = layout.buildDirectory.dir("dex")
 val rawJar = layout.buildDirectory.file("android-ui-server-classes.jar")
 val finalJar = layout.buildDirectory.file("android-ui-server.jar")
+val windowHierarchyTestJar = layout.buildDirectory.file("tests/window-hierarchy-test.jar")
 
 tasks.register<Delete>("clean") {
   group = "build"
@@ -209,6 +210,39 @@ tasks.register<Exec>("compileKotlinServer") {
   )
 }
 
+tasks.register<Exec>("compileWindowHierarchyTest") {
+  inputs.files(
+    file("src/com/example/androiduiserver/WindowHierarchy.kt"),
+    file("test/com/example/androiduiserver/WindowHierarchyTest.kt")
+  )
+  outputs.file(windowHierarchyTestJar)
+
+  doFirst {
+    requireFile(kotlinc, "kotlinc")
+    windowHierarchyTestJar.get().asFile.parentFile.mkdirs()
+  }
+
+  commandLine(
+    kotlinc.path,
+    "-jvm-target",
+    "1.8",
+    "-include-runtime",
+    "-d",
+    windowHierarchyTestJar.get().asFile.path,
+    file("src/com/example/androiduiserver/WindowHierarchy.kt").path,
+    file("test/com/example/androiduiserver/WindowHierarchyTest.kt").path
+  )
+}
+
+tasks.register<Exec>("testWindowHierarchy") {
+  group = "verification"
+  description = "Runs host-side tests for active/secondary accessibility-window ownership."
+  dependsOn("compileWindowHierarchyTest")
+  inputs.file(windowHierarchyTestJar)
+
+  commandLine("java", "-jar", windowHierarchyTestJar.get().asFile.path)
+}
+
 tasks.register<Exec>("dexUiautomatorServer") {
   dependsOn("jarKotlinClasses")
   inputs.file(rawJar)
@@ -257,7 +291,7 @@ tasks.register<Exec>("jarKotlinClasses") {
 tasks.register<Exec>("buildUiautomatorJar") {
   group = "build"
   description = "Builds build/android-ui-server.jar for adb shell uiautomator runtest."
-  dependsOn("dexUiautomatorServer")
+  dependsOn("dexUiautomatorServer", "testWindowHierarchy")
   inputs.dir(dexDir)
   outputs.file(finalJar)
 
