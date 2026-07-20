@@ -13,6 +13,9 @@ Bridge-backed MCP tools:
 - `android_trace_start`
 - `android_trace_stop`
 - `android_trace_status`
+- `android_viewer_start`
+- `android_viewer_status`
+- `android_viewer_stop`
 - `android_create_virtual_display`
 - `android_destroy_virtual_display`
 - `android_list_displays`
@@ -100,6 +103,18 @@ and `vN` refs. Collection items can additionally receive `#N` aliases (or `#N@sc
 when multiple collections are present); aliases are outline labels, while action tools
 continue to accept the adjacent snapshot ref. `includeEntries` defaults to `false`,
 `includeScreenshot` defaults to `false`, and `maxLines` defaults to `80`.
+
+The local Viewer companion is hosted by the MCP process rather than a second Android
+controller. `android_viewer_start` selects one device/display target, binds an HTTP
+server to `127.0.0.1`, and returns a URL containing a random session token in its URL
+fragment. Static assets are public on loopback so the fragment can bootstrap the page;
+all `/api/*` routes require the token as a bearer credential. Viewer refreshes populate
+the same in-memory snapshot cache used by MCP ref tools.
+
+Viewer mode is read-only unless `allowActions: true` was supplied at startup. Even in
+action mode, `/api/tap` accepts only a cached `snapshotId` plus an `aN` accessibility
+ref and delegates to the existing safe ref resolver. `oN` and `vN` refs are rejected.
+Only one companion Viewer can run per MCP process.
 
 Action tools that return `currentSnapshot`, including coordinate, ref, and locator taps, support stable snapshot waiting:
 

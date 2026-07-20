@@ -97,6 +97,15 @@ test("UI outline tool schema defaults to a compact response", () => {
   assert.equal(tool.inputSchema.additionalProperties, false);
 });
 
+test("Viewer companion tools are debug-scoped and safe by default", () => {
+  const start = __test.toolDefinition("android_viewer_start");
+  assert.equal(__test.capabilityGroupForTool("android_viewer_start"), "debug");
+  assert.equal(start.inputSchema.properties.port.default, 0);
+  assert.equal(start.inputSchema.properties.allowActions.default, false);
+  assert.equal(__test.toolDefinition("android_viewer_status").inputSchema.additionalProperties, false);
+  assert.equal(__test.toolDefinition("android_viewer_stop").inputSchema.additionalProperties, false);
+});
+
 test("stale ref relocation rejects ambiguous duplicate text", () => {
   const original = node({ id: "old", text: "Allow", role: "button", className: "android.widget.Button" });
   const relocated = __test.relocateAccessibilityNode(original, [
@@ -118,6 +127,7 @@ test("capability groups and trace sanitization are deterministic", () => {
   assert.equal(__test.capabilityGroupForTool("android_ocr_screen"), "ocr");
   assert.equal(__test.capabilityGroupForTool("android_launch_app"), "apps");
   assert.deepEqual(__test.sanitizeTraceValue({ text: "secret", pngBase64: "abc" }), { text: "[redacted:6]", pngBase64: "[omitted]" });
+  assert.deepEqual(__test.sanitizeTraceValue({ url: "http://127.0.0.1:1234/#token=secret" }), { url: "http://127.0.0.1:1234/#token=[redacted]" });
 });
 
 test("trace lifecycle writes sanitized local events", async () => {

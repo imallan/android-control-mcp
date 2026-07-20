@@ -8,6 +8,8 @@ import { performance } from "node:perf_hooks";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { startViewerHttpServer } from "./viewer.ts";
+import type { ViewerHttpServer } from "./viewer.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -97,6 +99,19 @@ type SemanticScreenBuild = {
   accessibilityNodeCount: number;
   ocr?: Awaited<ReturnType<typeof runOcr>>;
   vision?: Awaited<ReturnType<typeof runVisionDetect>>;
+};
+
+type ViewerCompanion = {
+  http?: ViewerHttpServer;
+  deviceId: string;
+  target: DisplayTarget;
+  allowActions: boolean;
+  ocrMode: OcrMode;
+  visionMode: OcrMode;
+  maxNodes: number;
+  currentFrame?: { snapshotId: string; png: Buffer };
+  refreshPromise?: Promise<Record<string, unknown>>;
+  operationQueue: Promise<unknown>;
 };
 
 type SnapshotCacheEntry = SemanticSnapshot & {
@@ -243,6 +258,7 @@ const ocrCache = new Map<string, { nodes: SemanticNode[]; rawOcr: string }>();
 
 type TraceState = { traceId: string; directory: string; startedAt: string; step: number };
 let activeTrace: TraceState | undefined;
+let activeViewer: ViewerCompanion | undefined;
 
 function invalidateSnapshots(deviceId: string, sessionId?: string): void {
   for (const [snapshotId, snapshot] of snapshotCache) {
@@ -610,6 +626,7 @@ function waitForBridgeProcessExit(bridge: BridgeContext): Promise<never> {
 const deviceManager = new DeviceManager();
 
 process.on("exit", () => {
+  activeViewer?.http?.server.close();
   deviceManager.stopAll();
 });
 
@@ -1262,7 +1279,9 @@ function outlineEntry(node: SemanticNode, height: number, scopeRank: Map<number,
     states,
     region,
     bounds: node.bounds,
-    source: node.source
+    source: node.source,
+    windowIndex,
+    actionable: isActionableNode(node)
   };
 }
 
@@ -1307,6 +1326,154 @@ async function androidGetUiOutline(input: unknown): Promise<ToolResult> {
     visionUsed: built.shouldRunVision,
     ...(includeEntries ? { entries: rendered.entries } : {})
   };
+}
+
+async function androidViewerStart(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  if (activeViewer?.http) {
+    return { success: false, status: "viewer_already_running", ...viewerStatus(activeViewer) };
+  }
+  const deviceId = await deviceIdParam(params);
+  const target = displayTargetParams(params);
+  const port = Math.min(65_535, Math.max(0, optionalIntegerParam(params, "port", 0)));
+  const viewer: ViewerCompanion = {
+    deviceId,
+    target,
+    allowActions: optionalBooleanParam(params, "allowActions", false),
+    ocrMode: optionalEnumParam(params, "ocrMode", ["auto", "force", "off"] as const, "auto"),
+    visionMode: optionalEnumParam(params, "visionMode", ["auto", "force", "off"] as const, "auto"),
+    maxNodes: Math.min(500, Math.max(1, optionalIntegerParam(params, "maxNodes", 200))),
+    operationQueue: Promise.resolve()
+  };
+  try {
+    viewer.http = await startViewerHttpServer({
+      port,
+      callbacks: {
+        status: () => viewerStatus(viewer),
+        refresh: () => queueViewerRefresh(viewer),
+        frame: async (snapshotId) => viewer.currentFrame?.snapshotId === snapshotId ? viewer.currentFrame.png : undefined,
+        tap: (snapshotId, ref) => runViewerOperation(viewer, () => tapFromViewer(viewer, snapshotId, ref))
+      }
+    });
+    activeViewer = viewer;
+    return { success: true, status: "viewer_started", ...viewerStatus(viewer) };
+  } catch (error) {
+    await viewer.http?.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function androidViewerStop(): Promise<ToolResult> {
+  const viewer = activeViewer;
+  if (!viewer?.http) return { success: true, status: "viewer_not_running" };
+  activeViewer = undefined;
+  await viewer.http.close();
+  return { success: true, status: "viewer_stopped", deviceId: viewer.deviceId };
+}
+
+async function androidViewerStatus(): Promise<ToolResult> {
+  return activeViewer?.http ? { success: true, status: "viewer_running", ...viewerStatus(activeViewer) } : { success: true, status: "viewer_not_running" };
+}
+
+function viewerStatus(viewer: ViewerCompanion): Record<string, unknown> {
+  return {
+    deviceId: viewer.deviceId,
+    ...(viewer.target.sessionId ? { sessionId: viewer.target.sessionId } : {}),
+    ...(viewer.target.displayId !== undefined ? { displayId: viewer.target.displayId } : {}),
+    allowActions: viewer.allowActions,
+    ocrMode: viewer.ocrMode,
+    visionMode: viewer.visionMode,
+    ...(viewer.http ? { host: "127.0.0.1", port: viewer.http.port, url: viewer.http.url } : {}),
+    ...(viewer.currentFrame ? { snapshotId: viewer.currentFrame.snapshotId } : {})
+  };
+}
+
+function runViewerOperation<T>(viewer: ViewerCompanion, operation: () => Promise<T>): Promise<T> {
+  const next = viewer.operationQueue.then(operation, operation);
+  viewer.operationQueue = next.catch(() => undefined);
+  return next;
+}
+
+function queueViewerRefresh(viewer: ViewerCompanion): Promise<Record<string, unknown>> {
+  if (viewer.refreshPromise) return viewer.refreshPromise;
+  const refresh = runViewerOperation(viewer, () => captureViewerSnapshot(viewer));
+  viewer.refreshPromise = refresh.finally(() => {
+    viewer.refreshPromise = undefined;
+  });
+  return viewer.refreshPromise;
+}
+
+async function captureViewerSnapshot(viewer: ViewerCompanion): Promise<Record<string, unknown>> {
+  const built = await buildSemanticScreen({
+    deviceId: viewer.deviceId,
+    ...viewer.target,
+    ocrMode: viewer.ocrMode,
+    visionMode: viewer.visionMode,
+    maxNodes: viewer.maxNodes,
+    retain: false
+  }, true);
+  if (!built.screenshot) throw new Error("Viewer refresh did not capture a screenshot.");
+  const rendered = renderUiOutline(built.snapshot, viewer.maxNodes);
+  viewer.currentFrame = { snapshotId: built.snapshot.snapshotId, png: await readFile(built.screenshot.imagePath) };
+  return {
+    success: true,
+    deviceId: viewer.deviceId,
+    displayId: built.snapshot.displayId,
+    ...(built.snapshot.sessionId ? { sessionId: built.snapshot.sessionId } : {}),
+    snapshotId: built.snapshot.snapshotId,
+    screenSignature: built.snapshot.screenSignature,
+    actionableSignature: built.snapshot.actionableSignature,
+    packageName: built.snapshot.packageName,
+    width: built.screenshot.width,
+    height: built.screenshot.height,
+    outline: rendered.outline,
+    entries: rendered.entries,
+    lineCount: rendered.lineCount,
+    nodeCount: built.snapshot.nodeCount,
+    truncated: rendered.truncated,
+    allowActions: viewer.allowActions,
+    treeUsable: built.tree.usable,
+    ocrUsed: built.shouldRunOcr,
+    visionUsed: built.shouldRunVision
+  };
+}
+
+async function tapFromViewer(viewer: ViewerCompanion, snapshotId: string, ref: string): Promise<Record<string, unknown>> {
+  if (!viewer.allowActions) {
+    return { success: false, status: "actions_disabled", message: "Restart the Viewer with allowActions=true to enable ref actions." };
+  }
+  if (!/^a\d+$/.test(ref)) {
+    return { success: false, status: "unsupported_ref_source", message: "Viewer actions only accept accessibility aN refs." };
+  }
+  const started = performance.now();
+  try {
+    const action = await androidTapRef({
+      deviceId: viewer.deviceId,
+      ...viewer.target,
+      snapshotId,
+      ref,
+      returnSnapshot: true,
+      waitForStable: true
+    });
+    const snapshot = await captureViewerSnapshot(viewer);
+    const result = {
+      success: action.success !== false,
+      action: {
+        success: action.success,
+        status: action.status,
+        actionStrategy: action.actionStrategy,
+        message: action.message,
+        from: action.from,
+        target: action.target
+      },
+      snapshot
+    };
+    await recordTraceEvent("android_viewer_tap", { deviceId: viewer.deviceId, snapshotId, ref }, result, undefined, Math.round(performance.now() - started)).catch(() => undefined);
+    return result;
+  } catch (error) {
+    await recordTraceEvent("android_viewer_tap", { deviceId: viewer.deviceId, snapshotId, ref }, undefined, error as Error, Math.round(performance.now() - started)).catch(() => undefined);
+    throw error;
+  }
 }
 
 function ocrOptions(input: unknown): {
@@ -3471,6 +3638,7 @@ const displayTargetProperties = {
 
 function sanitizeTraceValue(value: unknown, key = ""): unknown {
   if (key === "pngBase64" || key === "rawOcr" || key === "rawVision") return "[omitted]";
+  if (key === "url" && typeof value === "string" && value.includes("#token=")) return value.replace(/#token=.*/, "#token=[redacted]");
   if ((key === "text" || key === "targetText") && typeof value === "string") return `[redacted:${value.length}]`;
   if (Array.isArray(value)) return value.map((item) => sanitizeTraceValue(item));
   if (value && typeof value === "object") {
@@ -3536,6 +3704,7 @@ async function androidTraceStatus(): Promise<ToolResult> {
 
 function capabilityGroupForTool(name: string): CapabilityGroup {
   if (name.startsWith("android_trace_")) return "trace";
+  if (name.startsWith("android_viewer_")) return "debug";
   if (name === "android_ocr_screen") return "ocr";
   if (["android_current_app", "android_wait_for_package", "android_list_apps", "android_launch_app"].includes(name)) return "apps";
   if (["android_list_devices", "android_bridge_ping", "android_bridge_exit", "android_probe_virtual_display", "android_list_displays", "android_dump_tree", "android_dump_compact"].includes(name)) return "debug";
@@ -3576,6 +3745,36 @@ const tools: ToolDefinition[] = [
     description: "Return whether a local trace is active and its current step count.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: androidTraceStatus
+  },
+  {
+    name: "android_viewer_start",
+    description: "Start a token-authenticated local Viewer inside this MCP process so it shares bridge, snapshot, and safe-ref state.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProperties,
+        ...displayTargetProperties,
+        port: { type: "integer", minimum: 0, maximum: 65535, default: 0, description: "Loopback HTTP port. Use 0 to allocate an available port." },
+        allowActions: { type: "boolean", default: false, description: "Allow explicit accessibility-ref taps from the Viewer. OCR/vision refs remain observation-only." },
+        ocrMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
+        visionMode: { type: "string", enum: ["auto", "force", "off"], default: "auto" },
+        maxNodes: { type: "integer", minimum: 1, maximum: 500, default: 200 }
+      },
+      additionalProperties: false
+    },
+    handler: androidViewerStart
+  },
+  {
+    name: "android_viewer_status",
+    description: "Return the current in-process local Viewer status and URL.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidViewerStatus
+  },
+  {
+    name: "android_viewer_stop",
+    description: "Stop the current in-process local Viewer without stopping the Android bridge.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    handler: androidViewerStop
   },
   {
     name: "android_list_devices",

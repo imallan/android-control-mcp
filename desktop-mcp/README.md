@@ -18,6 +18,7 @@ on-device bridge, exposed over MCP stdio:
 - `android_ocr_screen`: run local OCR on the current screenshot and return compact OCR nodes
 - `android_get_semantic_screen`: return accessibility nodes with automatic or forced OCR fallback
 - `android_get_ui_outline`: return a compact `[Top]`/`[Content]`/`[Bottom]` outline using the same snapshot refs
+- `android_viewer_start`, `android_viewer_status`, `android_viewer_stop`: host a loopback-only visual companion inside the MCP process
 - `android_dump_tree`: XML hierarchy from the on-device bridge
 - `android_dump_compact`: compact node list from the on-device bridge
 - `android_tap`
@@ -42,6 +43,34 @@ Observation, wait, launch, coordinate, locator, and ref tools accept either
 `sessionId` or `displayId`. Supplying both is rejected. A virtual display session
 binds screenshot, accessibility, OCR/vision, snapshots, refs, and injected input to
 the same display. Snapshot refs cannot be reused across displays.
+
+## Local Viewer Companion
+
+Start the Viewer through MCP so it shares this server's bridge, operation queue,
+semantic snapshots, and ref cache:
+
+```json
+{
+  "name": "android_viewer_start",
+  "arguments": {
+    "deviceId": "emulator-5554",
+    "port": 0,
+    "allowActions": false
+  }
+}
+```
+
+The result contains a URL such as `http://127.0.0.1:49152/#token=...`. Open it in a
+local browser. The Viewer provides screenshot overlays, ref/role/source/bounds/window
+details, Outline text, source filters, manual refresh, and optional one-second live
+refresh. It binds only `127.0.0.1`, protects every API with a random bearer token,
+and defaults to read-only mode.
+
+When `allowActions` is true, an explicit Tap button is shown only for actionable
+accessibility `aN` refs. The backend executes the existing safe
+`snapshotId + ref` action path; OCR and vision refs remain observation-only. Use
+`android_viewer_stop` when finished. The standalone Viewer CLI is intentionally not
+part of this companion-only phase.
 
 ## Requirements
 

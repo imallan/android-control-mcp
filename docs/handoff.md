@@ -66,12 +66,18 @@ Hybrid tools:
 
 - `android_get_semantic_screen`
 - `android_get_ui_outline`
+- `android_viewer_start`, `android_viewer_status`, `android_viewer_stop`
 
 `android_get_semantic_screen` uses both screenshot capture and the bridge-backed compact tree. It can run OCR automatically when the accessibility tree is sparse.
 
 `android_get_ui_outline` reuses that semantic pipeline and snapshot cache, but defaults
 to a compact zoned text response with actionable refs and no screenshot. Pass
 `includeEntries: true` only when structured outline entries are needed.
+
+The Viewer companion runs inside the MCP process and therefore shares its bridge,
+queue, snapshot cache, and safe ref actions. It is loopback-only, bearer-token
+protected, read-only by default, and exposes OCR/vision nodes for inspection without
+making them action targets.
 
 ## Core Implementation
 

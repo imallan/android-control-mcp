@@ -112,8 +112,24 @@ try {
   const search = semantic.nodes.find((node) => node.resourceId === "com.android.settings:id/search_action_bar");
   assert.ok(search?.ref);
 
-  const tapped = await tool("android_tap_ref", { sessionId, snapshotId: semantic.snapshotId, ref: search.ref, stableTimeoutMs: 2500 });
-  assert.equal(tapped.success, true);
+  const viewer = await tool("android_viewer_start", { sessionId, port: 0, allowActions: true, ocrMode: "off", visionMode: "off" });
+  const viewerUrl = new URL(viewer.url);
+  const viewerToken = new URLSearchParams(viewerUrl.hash.slice(1)).get("token");
+  const viewerHeaders = { Authorization: `Bearer ${viewerToken}` };
+  assert.equal((await fetch(`${viewerUrl.origin}/api/status`)).status, 401);
+  const viewerSnapshot = await (await fetch(`${viewerUrl.origin}/api/refresh`, { method: "POST", headers: viewerHeaders })).json();
+  assert.equal(viewerSnapshot.sessionId, sessionId);
+  assert.ok(viewerSnapshot.entries.some((entry) => entry.ref === search.ref));
+  const viewerTap = await (await fetch(`${viewerUrl.origin}/api/tap`, {
+    method: "POST",
+    headers: { ...viewerHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ snapshotId: viewerSnapshot.snapshotId, ref: search.ref })
+  })).json();
+  assert.equal(viewerTap.success, true);
+  assert.ok(["fresh", "relocated"].includes(viewerTap.action.status));
+  const viewerStatus = await tool("android_viewer_status", {});
+  assert.equal(viewerStatus.snapshotId, viewerTap.snapshot.snapshotId);
+  assert.equal((await tool("android_viewer_stop", {})).status, "viewer_stopped");
   const refGone = await tool("android_wait_for_ref_gone", {
     sessionId,
     snapshotId: semantic.snapshotId,
@@ -245,6 +261,7 @@ try {
 
   process.stdout.write("headless virtual display e2e: PASS\n");
 } finally {
+  await tool("android_viewer_stop", {}).catch(() => undefined);
   if (sessionId) {
     await tool("android_destroy_virtual_display", { sessionId }).catch(() => undefined);
   }

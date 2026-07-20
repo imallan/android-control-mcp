@@ -39,6 +39,11 @@ workflow helpers for notifications, Quick Settings, keyboard, permissions, and r
 For token-efficient agent observation, `android_get_ui_outline` returns a zoned text
 outline while preserving the same snapshot-local refs used by semantic actions.
 
+An authenticated local Viewer can be hosted inside the MCP process with
+`android_viewer_start`. It shares the active bridge and snapshot/ref cache, displays
+the screenshot with semantic overlays, and is read-only unless `allowActions: true`
+is explicitly requested.
+
 The MCP server has no npm dependencies; it runs directly on Node 24's TypeScript support. It can start with no Android device connected. When a device-backed tool is called, the server discovers connected devices and starts the on-device UIAutomator bridge automatically.
 
 ## Install in Codex
