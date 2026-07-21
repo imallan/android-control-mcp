@@ -1034,6 +1034,19 @@ function parsePngSize(png: Buffer): { width: number; height: number } {
   };
 }
 
+async function defaultPhysicalDisplayId(deviceId: string): Promise<string> {
+  const output = await adbTextForDevice(deviceId, ["shell", "dumpsys", "SurfaceFlinger", "--display-id"]);
+  const match = output.match(/Display\s+(\d+)\s+\(HWC display 0\)/);
+  if (!match) {
+    throw new AndroidDeviceError("Could not resolve Android's default physical display ID.", {
+      status: "display_id_not_found",
+      deviceId,
+      output: truncate(output)
+    });
+  }
+  return match[1];
+}
+
 function displayTargetParams(input: Record<string, unknown>): DisplayTarget {
   const sessionId = optionalStringParam(input, "sessionId");
   const displayIdValue = input.displayId;
@@ -1092,7 +1105,10 @@ async function androidScreenshot(input: unknown): Promise<ScreenshotResult> {
     displayId = typeof response.displayId === "number" ? response.displayId : target.displayId;
     sessionId = typeof response.sessionId === "string" ? response.sessionId : target.sessionId;
   } else {
-    png = await adbBuffer(["exec-out", "screencap", "-p"], SCREENSHOT_TIMEOUT_MS, deviceId);
+    // Android emits the multi-display selection warning on stdout when no
+    // display is specified, which corrupts the PNG returned by exec-out.
+    const physicalDisplayId = await defaultPhysicalDisplayId(deviceId);
+    png = await adbBuffer(["exec-out", "screencap", "-d", physicalDisplayId, "-p"], SCREENSHOT_TIMEOUT_MS, deviceId);
     displayId = 0;
   }
   const { width, height } = parsePngSize(png);
