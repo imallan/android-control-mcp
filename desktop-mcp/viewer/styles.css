@@ -15,12 +15,12 @@ button:hover { background: #293244; }
 button:disabled { cursor: not-allowed; opacity: .45; }
 main { display: grid; grid-template-columns: minmax(340px, 1fr) minmax(320px, 460px); height: calc(100vh - 72px); }
 .screen-panel { display: grid; place-items: center; min-width: 0; overflow: auto; padding: 20px; background: radial-gradient(circle at center, #1a202c, #090b10 70%); }
-.stage { position: relative; max-width: 100%; max-height: 100%; box-shadow: 0 18px 60px #000a; }
-#screen { display: block; max-width: 100%; max-height: calc(100vh - 112px); width: auto; height: auto; }
-#overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; cursor: crosshair; }
+.stage { position: relative; max-width: 100%; max-height: 100%; box-shadow: 0 18px 60px #000a; user-select: none; -webkit-user-select: none; }
+#screen { display: block; max-width: 100%; max-height: calc(100vh - 112px); width: auto; height: auto; pointer-events: none; user-select: none; -webkit-user-drag: none; }
+#overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; cursor: crosshair; outline: none; user-select: none; -webkit-user-select: none; }
 .node { fill: color-mix(in srgb, var(--node-color) 12%, transparent); stroke: var(--node-color); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; transition: opacity 120ms ease; }
 .node.secondary { stroke-dasharray: 7 4; stroke-width: 3; }
-.node.selected { fill: color-mix(in srgb, #fff 22%, transparent); stroke: #fff; stroke-width: 3; }
+.node.selected { fill: color-mix(in srgb, #fff 22%, transparent); stroke: #ff3b30; stroke-width: 3; }
 #overlay.has-selection .node:not(.selected) { opacity: .32; }
 aside { overflow: auto; border-left: 1px solid #252a35; background: #11141b; }
 .filters { position: sticky; top: 0; z-index: 2; padding: 12px 14px; border-bottom: 1px solid #252a35; background: #11141bf2; font-size: 12px; }
