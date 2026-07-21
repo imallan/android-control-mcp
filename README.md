@@ -36,8 +36,10 @@ display remains display `0` when no target is supplied.
 The server also supports local sanitized traces, capability-group filtering,
 post-action wait conditions, cached OCR, ref-disappearance waits, and Android system
 workflow helpers for notifications, Quick Settings, keyboard, permissions, and recents.
-For token-efficient agent observation, `android_get_ui_outline` returns a zoned text
-outline while preserving the same snapshot-local refs used by semantic actions.
+For normal agent observation and navigation, prefer `android_get_ui_outline` as the
+default. It returns a token-efficient zoned text outline while preserving the same
+snapshot-local refs used by semantic actions. Use `android_get_semantic_screen` only
+as a rare fallback when the outline is insufficient or richer node metadata is needed.
 
 An authenticated local Viewer can be hosted inside the MCP process with
 `android_viewer_start`. It shares the active bridge and snapshot/ref cache, displays

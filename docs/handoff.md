@@ -73,6 +73,8 @@ Hybrid tools:
 `android_get_ui_outline` reuses that semantic pipeline and snapshot cache, but defaults
 to a compact zoned text response with actionable refs and no screenshot. Pass
 `includeEntries: true` only when structured outline entries are needed.
+It is the preferred default observation path; use `android_get_semantic_screen` only
+when the outline is insufficient or richer node metadata is genuinely needed.
 
 The Viewer companion runs inside the MCP process and therefore shares its bridge,
 queue, snapshot cache, and safe ref actions. It is loopback-only, bearer-token

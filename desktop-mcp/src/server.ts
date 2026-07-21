@@ -3973,7 +3973,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_get_semantic_screen",
-    description: "Return a unified compact screen model from accessibility nodes, with optional or automatic OCR and visual-icon fallback for sparse trees.",
+    description: "Fallback observation tool only. Use android_get_ui_outline first and normally prefer it. Call this richer semantic screen model only when the outline is insufficient or when detailed bounds, editable state, OCR/vision metadata, or raw node information is genuinely required.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3992,7 +3992,7 @@ const tools: ToolDefinition[] = [
   },
   {
     name: "android_get_ui_outline",
-    description: "Return a token-efficient zoned UI outline with the same snapshot-local refs used by semantic actions.",
+    description: "Preferred default observation tool. Return a token-efficient zoned UI outline with actionable snapshot-local refs. Use this first for normal screen understanding and navigation; fall back to android_get_semantic_screen only in rare cases when the outline is insufficient or richer node metadata is required.",
     inputSchema: {
       type: "object",
       properties: {

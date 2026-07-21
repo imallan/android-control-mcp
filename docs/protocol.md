@@ -103,6 +103,9 @@ and `vN` refs. Collection items can additionally receive `#N` aliases (or `#N@sc
 when multiple collections are present); aliases are outline labels, while action tools
 continue to accept the adjacent snapshot ref. `includeEntries` defaults to `false`,
 `includeScreenshot` defaults to `false`, and `maxLines` defaults to `80`.
+This is the preferred default observation tool. Use `android_get_semantic_screen` only
+as a rare fallback when the outline is insufficient or detailed node metadata is
+explicitly required.
 
 The local Viewer companion is hosted by the MCP process rather than a second Android
 controller. `android_viewer_start` selects one device/display target, binds an HTTP
