@@ -89,6 +89,63 @@ test("UI outline retains unlabeled actionable accessibility refs", () => {
   assert.match(rendered.outline, /a1 element \"unlabeled\" \[clickable\]/);
 });
 
+test("semantic snapshots preserve and outline the complete primary navigation collection", () => {
+  const navigationScope = 7;
+  const items = ["Contact", "Calls", "Chat", "Find"].flatMap((label, index) => {
+    const left = 20 + index * 260;
+    return [
+      node({
+        id: `tab-${label}`,
+        clickable: label !== "Chat",
+        selected: label === "Chat",
+        bounds: [left, 2160, left + 220, 2320],
+        center: [left + 110, 2240],
+        collectionScope: navigationScope,
+        collectionItem: { rowIndex: 0, rowSpan: 1, columnIndex: index, columnSpan: 1 }
+      }),
+      node({ id: `label-${label}`, text: label, bounds: [left + 55, 2260, left + 165, 2305], center: [left + 110, 2282], collectionScope: navigationScope })
+    ];
+  });
+  const nodes = __test.mergeSemanticNodes([
+    node({ id: "nav-collection", bounds: [0, 2140, 1080, 2340], center: [540, 2240], collectionScope: navigationScope, collection: { rowCount: 1, columnCount: 4 } }),
+    ...Array.from({ length: 8 }, (_, index) => node({ id: `message-${index}`, text: `Message ${index}`, clickable: true, bounds: [0, 200 + index * 100, 1000, 280 + index * 100], center: [500, 240 + index * 100] })),
+    ...items
+  ], [], [], 5);
+  const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
+  const rendered = __test.renderUiOutline(snapshot, 20);
+
+  assert.equal(nodes.filter((item) => item.landmark === "primary_navigation").length, 4);
+  assert.match(rendered.outline, /\[Primary navigation\]/);
+  assert.match(rendered.outline, /tab "Contact"/);
+  assert.match(rendered.outline, /tab "Calls"/);
+  assert.match(rendered.outline, /tab "Chat" \[selected\]/);
+  assert.match(rendered.outline, /tab "Find"/);
+  assert.doesNotMatch(rendered.outline, /text "Contact"/);
+});
+
+test("semantic snapshots recognize aligned bottom buttons without collection metadata", () => {
+  const labels = ["Home", "Shorts", "Subscriptions", "Library"];
+  const nodes = __test.mergeSemanticNodes(labels.flatMap((label, index) => {
+    const left = index * 270;
+    return [node({
+      id: `bottom-${label}`,
+      contentDesc: label,
+      className: "android.widget.Button",
+      clickable: true,
+      selected: label === "Home",
+      bounds: [left, 2211, left + 270, 2337],
+      center: [left + 135, 2274]
+    })];
+  }), [], [], 20);
+  const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
+  const rendered = __test.renderUiOutline(snapshot, 20);
+
+  assert.equal(nodes.filter((item) => item.landmark === "primary_navigation").length, 4);
+  assert.match(rendered.outline, /\[Primary navigation\]/);
+  assert.match(rendered.outline, /tab "Home" \[selected,clickable\]/);
+  assert.match(rendered.outline, /tab "Subscriptions"/);
+});
+
 test("UI outline tool schema defaults to a compact response", () => {
   const tool = __test.toolDefinition("android_get_ui_outline");
   assert.equal(tool.inputSchema.properties.includeScreenshot.default, false);

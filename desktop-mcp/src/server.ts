@@ -65,6 +65,10 @@ type SemanticNode = {
     columnSpan: number;
     heading?: boolean;
   };
+  /** Inferred from a visible horizontal accessibility collection. */
+  landmark?: "primary_navigation";
+  /** A descendant text label promoted onto an actionable semantic container. */
+  label?: string;
   actions?: string[];
   source: "accessibility" | "ocr" | "vision";
   confidence?: number;
@@ -1600,7 +1604,7 @@ async function buildSemanticScreen(params: Record<string, unknown>, includeScree
 
 function renderUiOutline(snapshot: SemanticSnapshot, maxLines: number): { outline: string; entries: Record<string, unknown>[]; lineCount: number; truncated: boolean } {
   const height = snapshot.height ?? Math.max(1, ...snapshot.nodes.map((node) => node.bounds[3]));
-  const candidates = snapshot.nodes.filter((node) => node.ref && (outlineLabel(node) || isActionableNode(node)));
+  const candidates = snapshot.nodes.filter((node) => node.ref && !isPromotedNavigationLabel(node, snapshot.nodes) && (outlineLabel(node) || isActionableNode(node)));
   const selected = [...candidates]
     .sort((a, b) => Number(isActionableNode(b)) - Number(isActionableNode(a)) || (b.score ?? 0) - (a.score ?? 0))
     .slice(0, maxLines);
@@ -1628,7 +1632,7 @@ function renderUiOutline(snapshot: SemanticSnapshot, maxLines: number): { outlin
     });
   }
   const secondary = [...sections.keys()].filter((name) => name.startsWith("Window ")).sort((a, b) => Number(b.slice(7)) - Number(a.slice(7)));
-  const order = [...secondary, "Top", "Content", "Bottom"];
+  const order = [...secondary, "Top", "Content", "Bottom", "Primary navigation"];
   const lines: string[] = [];
   for (const region of order) {
     const values = sections.get(region);
@@ -1644,7 +1648,15 @@ function renderUiOutline(snapshot: SemanticSnapshot, maxLines: number): { outlin
 
 function outlineEntry(node: SemanticNode, height: number, scopeRank: Map<number, number>): Record<string, unknown> {
   const windowIndex = node.windowIndex ?? 0;
-  const region = windowIndex > 0 ? `Window ${windowIndex + 1}` : node.center[1] < height * 0.18 ? "Top" : node.center[1] > height * 0.82 ? "Bottom" : "Content";
+  const region = windowIndex > 0
+    ? `Window ${windowIndex + 1}`
+    : node.landmark === "primary_navigation"
+      ? "Primary navigation"
+      : node.center[1] < height * 0.18
+        ? "Top"
+        : node.center[1] > height * 0.82
+          ? "Bottom"
+          : "Content";
   const scope = node.collectionScope === undefined ? undefined : scopeRank.get(node.collectionScope);
   const row = node.collectionItem ? node.collectionItem.rowIndex + 1 : undefined;
   const alias = row === undefined || scope === undefined ? undefined : scope === 1 ? `#${row}` : `#${row}@${scope}`;
@@ -1673,7 +1685,16 @@ function outlineEntry(node: SemanticNode, height: number, scopeRank: Map<number,
 
 function outlineLabel(node: SemanticNode): string {
   const resourceLabel = node.resourceId?.split("/").at(-1)?.replaceAll("_", " ");
-  return truncate((node.text ?? node.contentDesc ?? resourceLabel ?? node.role ?? "").replace(/\s+/g, " ").trim(), 80);
+  return truncate((node.label ?? node.text ?? node.contentDesc ?? resourceLabel ?? node.role ?? "").replace(/\s+/g, " ").trim(), 80);
+}
+
+function isPromotedNavigationLabel(node: SemanticNode, nodes: SemanticNode[]): boolean {
+  if (node.landmark || !outlineLabel(node)) return false;
+  return nodes.some((tab) =>
+    tab.landmark === "primary_navigation" &&
+    tab.label === outlineLabel(node) &&
+    boundsContains(tab.bounds, node.bounds)
+  );
 }
 
 function escapeOutlineLabel(label: string): string {
@@ -2362,7 +2383,94 @@ function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: Semant
   // Filter vision detections against accessibility + OCR nodes to avoid duplicates
   const filteredVision = filterVisionVsExisting(visionNodes, [...accessibilityNodes, ...ocrNodes]);
   const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes, ...filteredVision]);
-  return assignSnapshotRefs(rankSemanticNodes(merged).slice(0, maxNodes));
+  const ranked = annotatePrimaryNavigation(rankSemanticNodes(merged));
+  return assignSnapshotRefs(preservePrimaryNavigation(ranked, maxNodes));
+}
+
+/**
+ * Detect the app's persistent bottom bar from the collection metadata supplied by
+ * UIAutomator. This deliberately requires a one-row, multi-column collection in
+ * the lower screen so ordinary vertical lists are not classified as navigation.
+ */
+function annotatePrimaryNavigation(nodes: SemanticNode[]): SemanticNode[] {
+  const height = Math.max(1, ...nodes.map((node) => node.bounds[3]));
+  const navigationScopes = new Set(nodes
+    .filter((node) =>
+      node.collectionScope !== undefined &&
+      node.collection?.rowCount === 1 &&
+      node.collection.columnCount >= 3 &&
+      node.bounds[1] >= height * 0.65
+    )
+    .map((node) => node.collectionScope));
+  const fallbackNavigationIds = inferBottomNavigationButtonIds(nodes, height);
+
+  return nodes.map((node) => {
+    const isCollectionNavigation = node.collectionScope !== undefined &&
+      node.collectionItem !== undefined &&
+      navigationScopes.has(node.collectionScope);
+    if (!isCollectionNavigation && !fallbackNavigationIds.has(node.id)) {
+      return node;
+    }
+    const labelNode = nodes.find((candidate) =>
+      candidate !== node &&
+      candidate.collectionScope === node.collectionScope &&
+      Boolean(candidate.text || candidate.contentDesc) &&
+      boundsContains(node.bounds, candidate.bounds)
+    );
+    const label = labelNode ? outlineLabel(labelNode) : undefined;
+    return {
+      ...node,
+      role: "tab",
+      landmark: "primary_navigation",
+      ...(label ? { label } : {})
+    };
+  });
+}
+
+/**
+ * Some apps (for example, YouTube) expose a bottom bar as sibling Buttons rather
+ * than an accessibility collection. Recognize a wide, aligned run of at least
+ * three labelled controls only in the physical bottom band; this keeps floating
+ * action strips and horizontal content carousels out of the primary-nav model.
+ */
+function inferBottomNavigationButtonIds(nodes: SemanticNode[], height: number): Set<string> {
+  const candidates = nodes.filter((node) =>
+    node.bounds[1] >= height * 0.88 &&
+    Boolean(outlineLabel(node)) &&
+    (node.clickable || node.selected) &&
+    (node.role === "button" || node.className?.includes("Button"))
+  );
+  const groups = new Map<number, SemanticNode[]>();
+  for (const candidate of candidates) {
+    const key = Math.round(candidate.center[1] / 24);
+    const group = groups.get(key) ?? [];
+    group.push(candidate);
+    groups.set(key, group);
+  }
+  const navigation = [...groups.values()].find((group) => {
+    if (group.length < 3) return false;
+    const ordered = [...group].sort((a, b) => a.bounds[0] - b.bounds[0]);
+    const left = ordered[0].bounds[0];
+    const right = ordered.at(-1)!.bounds[2];
+    return right - left >= Math.max(...nodes.map((node) => node.bounds[2])) * 0.7;
+  });
+  return new Set(navigation?.map((node) => node.id) ?? []);
+}
+
+/** Keep every visible primary-navigation item when a capped snapshot is built. */
+function preservePrimaryNavigation(nodes: SemanticNode[], maxNodes: number): SemanticNode[] {
+  if (nodes.length <= maxNodes) return nodes;
+  const required = nodes.filter((node) => node.landmark === "primary_navigation");
+  if (required.length === 0) return nodes.slice(0, maxNodes);
+  if (required.length >= maxNodes) return required.slice(0, maxNodes);
+
+  const selected = nodes.slice(0, maxNodes);
+  const selectedIds = new Set(selected.map((node) => node.id));
+  const missing = required.filter((node) => !selectedIds.has(node.id));
+  if (missing.length === 0) return selected;
+  const retained = selected.filter((node) => node.landmark !== "primary_navigation").slice(0, maxNodes - required.length);
+  const retainedIds = new Set(retained.map((node) => node.id));
+  return nodes.filter((node) => retainedIds.has(node.id) || node.landmark === "primary_navigation");
 }
 
 function dedupeSemanticNodes(nodes: SemanticNode[]): SemanticNode[] {
@@ -3124,6 +3232,13 @@ function unionBounds(bounds: Bounds[]): Bounds {
 
 function boundsCenter(bounds: Bounds): [number, number] {
   return [Math.round((bounds[0] + bounds[2]) / 2), Math.round((bounds[1] + bounds[3]) / 2)];
+}
+
+function boundsContains(container: Bounds, candidate: Bounds): boolean {
+  return container[0] <= candidate[0] &&
+    container[1] <= candidate[1] &&
+    container[2] >= candidate[2] &&
+    container[3] >= candidate[3];
 }
 
 function safeFileName(value: string): string {
