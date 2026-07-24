@@ -34,6 +34,7 @@ type DisplayTarget = { sessionId?: string; displayId?: number };
 
 type SemanticNode = {
   id: string;
+  parentId?: string;
   ref?: string;
   text?: string;
   contentDesc?: string;
@@ -69,6 +70,8 @@ type SemanticNode = {
   landmark?: "primary_navigation";
   /** A descendant text label promoted onto an actionable semantic container. */
   label?: string;
+  /** Semantic-node ID from which the promoted label was obtained. */
+  labelSourceId?: string;
   actions?: string[];
   source: "accessibility" | "ocr" | "vision";
   confidence?: number;
@@ -1604,7 +1607,7 @@ async function buildSemanticScreen(params: Record<string, unknown>, includeScree
 
 function renderUiOutline(snapshot: SemanticSnapshot, maxLines: number): { outline: string; entries: Record<string, unknown>[]; lineCount: number; truncated: boolean } {
   const height = snapshot.height ?? Math.max(1, ...snapshot.nodes.map((node) => node.bounds[3]));
-  const candidates = snapshot.nodes.filter((node) => node.ref && !isPromotedNavigationLabel(node, snapshot.nodes) && (outlineLabel(node) || isActionableNode(node)));
+  const candidates = snapshot.nodes.filter((node) => node.ref && !isPromotedLabel(node, snapshot.nodes) && (outlineLabel(node) || isActionableNode(node)));
   const selected = [...candidates]
     .sort((a, b) => Number(isActionableNode(b)) - Number(isActionableNode(a)) || (b.score ?? 0) - (a.score ?? 0))
     .slice(0, maxLines);
@@ -1688,12 +1691,11 @@ function outlineLabel(node: SemanticNode): string {
   return truncate((node.label ?? node.text ?? node.contentDesc ?? resourceLabel ?? node.role ?? "").replace(/\s+/g, " ").trim(), 80);
 }
 
-function isPromotedNavigationLabel(node: SemanticNode, nodes: SemanticNode[]): boolean {
+function isPromotedLabel(node: SemanticNode, nodes: SemanticNode[]): boolean {
   if (node.landmark || !outlineLabel(node)) return false;
   return nodes.some((tab) =>
-    tab.landmark === "primary_navigation" &&
-    tab.label === outlineLabel(node) &&
-    boundsContains(tab.bounds, node.bounds)
+    tab.labelSourceId === node.id ||
+    (tab.landmark === "primary_navigation" && tab.label === outlineLabel(node) && boundsContains(tab.bounds, node.bounds))
   );
 }
 
@@ -2324,6 +2326,7 @@ function compactNodes(compact: Record<string, unknown>): SemanticNode[] {
       ...(typeof node.depth === "number" ? { depth: node.depth } : {}),
       ...(typeof node.windowIndex === "number" ? { windowIndex: node.windowIndex } : {}),
       ...(typeof node.collectionScope === "number" ? { collectionScope: node.collectionScope } : {}),
+      ...(typeof node.parentIndex === "number" && node.parentIndex > 0 ? { parentId: `accessibility:${node.parentIndex}` } : {}),
       ...(collection ? { collection } : {}),
       ...(collectionItem ? { collectionItem } : {}),
       ...(actions && actions.length > 0 ? { actions } : {}),
@@ -2383,8 +2386,72 @@ function mergeSemanticNodes(accessibilityNodes: SemanticNode[], ocrNodes: Semant
   // Filter vision detections against accessibility + OCR nodes to avoid duplicates
   const filteredVision = filterVisionVsExisting(visionNodes, [...accessibilityNodes, ...ocrNodes]);
   const merged = dedupeSemanticNodes([...accessibilityNodes, ...ocrNodes, ...filteredVision]);
-  const ranked = annotatePrimaryNavigation(rankSemanticNodes(merged));
-  return assignSnapshotRefs(preservePrimaryNavigation(ranked, maxNodes));
+  const annotated = promoteAccessibleLabels(annotatePrimaryNavigation(rankSemanticNodes(merged)));
+  return assignSnapshotRefs(preservePrimaryNavigation(annotated, maxNodes));
+}
+
+/**
+ * Promote one unambiguous, passive accessible label onto its clickable container.
+ * Parent identity from the bridge is preferred; strict geometric containment keeps
+ * the fallback compatible with older bridges that do not supply parentIndex.
+ */
+function promoteAccessibleLabels(nodes: SemanticNode[]): SemanticNode[] {
+  return nodes.map((parent) => {
+    if (!isPromotableContainer(parent) || hasExplicitLabel(parent)) return parent;
+    const hierarchyCandidates = nodes.filter((candidate) => isLabelCandidate(candidate) && isDescendantOf(candidate, parent, nodes));
+    const geometryCandidates = nodes.filter((candidate) =>
+      isLabelCandidate(candidate) &&
+      boundsContains(parent.bounds, candidate.bounds) &&
+      !hasNestedActionableContainer(candidate, parent, nodes)
+    );
+    const labelNode = hierarchyCandidates.length === 1
+      ? hierarchyCandidates[0]
+      : hierarchyCandidates.length === 0 && geometryCandidates.length === 1
+        ? geometryCandidates[0]
+        : undefined;
+    if (!labelNode) return parent;
+    return {
+      ...parent,
+      role: parent.role ?? "button",
+      label: outlineLabel(labelNode),
+      labelSourceId: labelNode.id
+    };
+  });
+}
+
+function isPromotableContainer(node: SemanticNode): boolean {
+  return node.clickable === true || node.checkable === true;
+}
+
+function hasExplicitLabel(node: SemanticNode): boolean {
+  return Boolean(node.label || node.text || node.contentDesc);
+}
+
+function isLabelCandidate(node: SemanticNode): boolean {
+  return Boolean(node.text || node.contentDesc) &&
+    node.clickable !== true &&
+    node.checkable !== true &&
+    node.scrollable !== true &&
+    node.editable !== true;
+}
+
+function isDescendantOf(node: SemanticNode, ancestor: SemanticNode, nodes: SemanticNode[]): boolean {
+  const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]));
+  let current = node.parentId ? byId.get(node.parentId) : undefined;
+  while (current) {
+    if (current.id === ancestor.id) return true;
+    current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  return false;
+}
+
+function hasNestedActionableContainer(label: SemanticNode, parent: SemanticNode, nodes: SemanticNode[]): boolean {
+  return nodes.some((candidate) =>
+    candidate.id !== parent.id &&
+    isPromotableContainer(candidate) &&
+    boundsContains(parent.bounds, candidate.bounds) &&
+    boundsContains(candidate.bounds, label.bounds)
+  );
 }
 
 /**
@@ -2422,7 +2489,7 @@ function annotatePrimaryNavigation(nodes: SemanticNode[]): SemanticNode[] {
       ...node,
       role: "tab",
       landmark: "primary_navigation",
-      ...(label ? { label } : {})
+      ...(label ? { label, labelSourceId: labelNode!.id } : {})
     };
   });
 }

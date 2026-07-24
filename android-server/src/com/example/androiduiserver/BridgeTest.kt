@@ -1389,7 +1389,8 @@ class BridgeTest : UiAutomatorTestCase() {
       depth: Int,
       windowIndex: Int,
       inheritedCollectionScope: Int?,
-      collectionCounter: IntArray
+      collectionCounter: IntArray,
+      parentIndex: Int? = null
     ) {
       if (node == null || depth > 80) {
         return
@@ -1451,15 +1452,18 @@ class BridgeTest : UiAutomatorTestCase() {
         if (actions.isNotEmpty()) {
           compact["actions"] = actions
         }
+        if (parentIndex != null) compact["parentIndex"] = parentIndex
         out.add(compact)
       }
+
+      val currentIndex = if (hasReadableText || hasAction || hasStructure) out.size else parentIndex
 
       val childCount = node.childCount
       for (index in 0 until childCount) {
         val child = node.getChild(index)
         if (child != null) {
           try {
-            collectCompactNodes(child, out, depth + 1, windowIndex, collectionScope, collectionCounter)
+            collectCompactNodes(child, out, depth + 1, windowIndex, collectionScope, collectionCounter, currentIndex)
           } finally {
             child.recycle()
           }

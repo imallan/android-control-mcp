@@ -89,6 +89,33 @@ test("UI outline retains unlabeled actionable accessibility refs", () => {
   assert.match(rendered.outline, /a1 element \"unlabeled\" \[clickable\]/);
 });
 
+test("outline promotes one contained passive label onto an unlabeled clickable parent", () => {
+  const nodes = __test.mergeSemanticNodes([
+    node({ id: "sort", clickable: true, bounds: [828, 254, 933, 380], center: [880, 317] }),
+    node({ id: "sort-label", text: "Choose contact sort order", bounds: [870, 296, 912, 338], center: [891, 317] })
+  ], [], [], 10);
+  const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
+  const rendered = __test.renderUiOutline(snapshot, 10);
+  const button = nodes.find((item) => item.id === "sort");
+
+  assert.equal(button.role, "button");
+  assert.equal(button.label, "Choose contact sort order");
+  assert.equal(button.labelSourceId, "sort-label");
+  assert.match(rendered.outline, /button "Choose contact sort order"/);
+  assert.doesNotMatch(rendered.outline, /text "Choose contact sort order"/);
+});
+
+test("outline does not promote ambiguous contained labels", () => {
+  const nodes = __test.mergeSemanticNodes([
+    node({ id: "card", clickable: true, bounds: [0, 100, 1000, 300], center: [500, 200] }),
+    node({ id: "title", text: "Title", bounds: [20, 120, 300, 160], center: [160, 140] }),
+    node({ id: "subtitle", text: "Subtitle", bounds: [20, 180, 400, 220], center: [210, 200] })
+  ], [], [], 10);
+  const card = nodes.find((item) => item.id === "card");
+
+  assert.equal(card.label, undefined);
+});
+
 test("semantic snapshots preserve and outline the complete primary navigation collection", () => {
   const navigationScope = 7;
   const items = ["Contact", "Calls", "Chat", "Find"].flatMap((label, index) => {
