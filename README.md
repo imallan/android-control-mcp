@@ -36,6 +36,12 @@ display remains display `0` when no target is supplied.
 The server also supports local sanitized traces, capability-group filtering,
 post-action wait conditions, cached OCR, ref-disappearance waits, and Android system
 workflow helpers for notifications, Quick Settings, keyboard, permissions, and recents.
+Its `media` capability adds a display-0 `screenrecord` lifecycle through
+`android_record_video_start`, `android_record_video_status`, and
+`android_record_video_stop`. Each device has at most one managed recording; stop uses
+the exact verified PID, pulls the finalized MP4 to a collision-safe local destination,
+and removes the generated remote files. Recordings are capped at 180 seconds, contain
+no audio, and do not support display rotation during capture.
 For normal agent observation and navigation, prefer `android_get_ui_outline` as the
 default. It returns a token-efficient zoned text outline while preserving the same
 snapshot-local refs used by semantic actions. Use `android_get_semantic_screen` only

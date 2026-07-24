@@ -8,6 +8,7 @@ on-device bridge, exposed over MCP stdio:
 - `android_list_devices`: list ADB devices and managed bridge state
 - `android_capabilities`: report enabled tool capability groups
 - `android_trace_start`, `android_trace_status`, `android_trace_stop`: local sanitized agent-debugging traces
+- `android_record_video_start`, `android_record_video_status`, `android_record_video_stop`: record display 0 to a local MP4
 - `android_create_virtual_display`, `android_list_displays`, `android_destroy_virtual_display`: manage one bridge-owned Android 14+ headless display per device
 - `android_current_app`: return the current foreground Android package
 - `android_wait_for_package`
@@ -43,6 +44,43 @@ Observation, wait, launch, coordinate, locator, and ref tools accept either
 `sessionId` or `displayId`. Supplying both is rejected. A virtual display session
 binds screenshot, accessibility, OCR/vision, snapshots, refs, and injected input to
 the same display. Snapshot refs cannot be reused across displays.
+
+## Display 0 Video Recording
+
+Start one managed `screenrecord` process per device, inspect it without side effects,
+then stop it to finalize and pull the MP4:
+
+```json
+{
+  "name": "android_record_video_start",
+  "arguments": {
+    "deviceId": "emulator-5554",
+    "size": "1280x720",
+    "bitRate": 6000000,
+    "timeLimitSec": 30,
+    "outputPath": "/tmp/demo.mp4",
+    "overwrite": false
+  }
+}
+```
+
+Call `android_record_video_status` to distinguish `recording` from
+`completed_pending_pull`. Even after the time limit expires, call
+`android_record_video_stop` to pull the finalized file and remove the generated
+remote files. Stop sends SIGINT only while the saved PID still belongs to the exact
+generated `screenrecord` path.
+
+The first version supports display 0 only. It explicitly rejects `sessionId` and any
+non-zero `displayId`; virtual-display recording is deferred. `size` uses
+`WIDTHxHEIGHT`, `bitRate` is bits per second, and `timeLimitSec` defaults to and is
+capped at 180 seconds. Official `screenrecord` has no audio, and rotating the display
+during recording can crop the resulting video.
+
+When `outputPath` is omitted, recordings are saved under
+`<OS temp>/android-ui-mcp/recordings/<deviceId>/`. Existing files are rejected by
+default. Pass `overwrite: true` at start to permit replacement. Pulling uses a local
+staging file and atomic final commit; pull or remote-cleanup failures retain retryable
+managed state.
 
 ## Local Viewer Companion
 
@@ -110,7 +148,7 @@ Optional environment variables:
 - `ANDROID_UI_MCP_PORT`: first bridge/adb-forward port, default `27183`
 - `ANDROID_UI_MCP_PORT_BASE`: base port for additional device forwards, default `ANDROID_UI_MCP_PORT` or `27183`
 - `ANDROID_UI_MCP_TIMEOUT_MS`: bridge request timeout, default `15000`
-- `ANDROID_MCP_CAPABILITIES`: optional comma-separated tool groups (`core,ocr,apps,debug,trace,vision`); defaults to all
+- `ANDROID_MCP_CAPABILITIES`: optional comma-separated tool groups (`core,ocr,apps,debug,trace,vision,media`); defaults to all
 - `ANDROID_MCP_TRACE_DIR`: local trace root, default `<OS temp>/android-ui-mcp/traces`
 
 ## MCP Client Configuration
@@ -161,6 +199,7 @@ Restart or reload Codex after installation so it discovers the tools.
 - Coordinate, ref, and locator action tools default to returning a post-action snapshot after waiting up to 1500 ms for strict or actionable accessibility stability.
 - `android_perform_action` and `android_perform_action_ref` accept predefined accessibility action names or custom action labels exposed by the target node.
 - `android_screenshot` and `android_ocr_screen` use direct ADB capture for display 0 and bridge-owned ImageReader capture for virtual displays.
+- `android_record_video_start`, `android_record_video_status`, and `android_record_video_stop` use the official device-side `screenrecord` command and do not require the persistent UIAutomator bridge.
 - `android_ocr_screen` and OCR fallback in the semantic-screen/outline tools support `ocrEngine: "apple-vision"` and `ocrEngine: "tesseract"`.
 - OCR results use a bounded content-and-parameter LRU and report `ocrCached`.
 - Mutating tools accept `after.waitForText` and/or `after.waitForPackage` postconditions.
@@ -172,6 +211,7 @@ Restart or reload Codex after installation so it discovers the tools.
 ## Limitations
 
 - `android_screenshot` writes `/tmp/android-ui-mcp/<deviceId>/current-screen.png` by default. Use `retain=true` only when you want historical screenshots.
+- Managed video recording is limited to display 0, 180 seconds, and one active or pending recording per device in the current MCP process. It records no audio and does not support rotation during capture.
 - Text input uses accessibility `ACTION_SET_TEXT` when possible, but depends on the target node exposing editable accessibility actions.
 - App-name launch uses package/activity-derived aliases. `applicationId` launch is deterministic.
 - `FLAG_SECURE` apps can return black screenshots.

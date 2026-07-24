@@ -1,11 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, appendFile, copyFile, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { access, appendFile, copyFile, link, mkdir, mkdtemp, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { startViewerHttpServer } from "./viewer.ts";
@@ -190,7 +190,35 @@ type ToolDefinition = {
   inputSchema: Record<string, unknown>;
   handler: (input: unknown) => Promise<ToolResult>;
 };
-type CapabilityGroup = "core" | "ocr" | "apps" | "debug" | "trace" | "vision";
+type CapabilityGroup = "core" | "ocr" | "apps" | "debug" | "trace" | "vision" | "media";
+
+type VideoRecordingPhase = "recording" | "completed_pending_pull" | "cleanup_pending";
+
+type VideoRecordingState = {
+  deviceId: string;
+  displayId: 0;
+  pid: number;
+  phase: VideoRecordingPhase;
+  remotePath: string;
+  remoteLogPath: string;
+  remotePidPath: string;
+  outputPath: string;
+  overwrite: boolean;
+  startedAt: string;
+  startedAtMs: number;
+  timeLimitSec: number;
+  size?: string;
+  bitRate?: number;
+  stoppedAt?: string;
+  fileSizeBytes?: number;
+};
+
+type VideoRuntime = {
+  resolveDeviceId: (input: Record<string, unknown>) => Promise<string>;
+  adbText: (args: string[], timeoutMs?: number, deviceId?: string) => Promise<string>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+};
 
 type AdbDeviceState = "device" | "offline" | "unauthorized" | string;
 
@@ -243,9 +271,17 @@ const DEFAULT_VIRTUAL_DISPLAY_WIDTH = 1280;
 const DEFAULT_VIRTUAL_DISPLAY_HEIGHT = 960;
 const DEFAULT_VIRTUAL_DISPLAY_DPI = 160;
 const DEFAULT_VIRTUAL_FRAME_TIMEOUT_MS = 2_000;
+const DEFAULT_RECORD_VIDEO_TIME_LIMIT_SEC = 180;
+const RECORD_VIDEO_START_PROBE_DELAY_MS = 200;
+const RECORD_VIDEO_STOP_TIMEOUT_MS = 10_000;
+const RECORD_VIDEO_PULL_TIMEOUT_MS = 120_000;
+const RECORD_VIDEO_POLL_INTERVAL_MS = 100;
+const RECORD_VIDEO_REMOTE_ROOT = "/data/local/tmp/android-ui-mcp/recordings";
+const RECORD_VIDEO_LOCAL_ROOT = join(tmpdir(), "android-ui-mcp", "recordings");
+const RECORD_VIDEO_ROTATION_WARNING = "screenrecord does not support display rotation during recording; rotating the display may crop the video.";
 const OCR_CACHE_LIMIT = 20;
 const TRACE_ROOT = process.env.ANDROID_MCP_TRACE_DIR ?? join(tmpdir(), "android-ui-mcp", "traces");
-const ALL_CAPABILITY_GROUPS: CapabilityGroup[] = ["core", "ocr", "apps", "debug", "trace", "vision"];
+const ALL_CAPABILITY_GROUPS: CapabilityGroup[] = ["core", "ocr", "apps", "debug", "trace", "vision", "media"];
 const enabledCapabilityGroups = new Set<CapabilityGroup>(
   (process.env.ANDROID_MCP_CAPABILITIES?.split(",").map((value) => value.trim()).filter((value): value is CapabilityGroup => ALL_CAPABILITY_GROUPS.includes(value as CapabilityGroup))
     ?? ALL_CAPABILITY_GROUPS)
@@ -255,6 +291,9 @@ const snapshotCache = new Map<string, SnapshotCacheEntry>();
 const activeVirtualSessions = new Map<string, string>();
 const staleVirtualSessions = new Map<string, "bridge_restarted" | "virtual_display_recreated" | "virtual_display_not_found">();
 const ocrCache = new Map<string, { nodes: SemanticNode[]; rawOcr: string }>();
+const activeVideoRecordings = new Map<string, VideoRecordingState>();
+const videoRecordingQueues = new Map<string, Promise<void>>();
+const reservedVideoOutputPaths = new Map<string, string>();
 
 type TraceState = { traceId: string; directory: string; startedAt: string; step: number };
 let activeTrace: TraceState | undefined;
@@ -974,6 +1013,336 @@ function optionalBooleanParam(input: Record<string, unknown>, name: string, defa
 
 async function deviceIdParam(input: Record<string, unknown>): Promise<string> {
   return deviceManager.resolveDeviceId(input);
+}
+
+let videoRuntime: VideoRuntime = {
+  resolveDeviceId: (input) => deviceManager.resolveDeviceId(input),
+  adbText,
+  sleep,
+  now: () => Date.now()
+};
+const defaultVideoRuntime = { ...videoRuntime };
+
+function validateRecordVideoDisplayTarget(input: Record<string, unknown>): void {
+  if (Object.prototype.hasOwnProperty.call(input, "sessionId")) {
+    throw new ToolInputError("sessionId is not supported for video recording; only display 0 is supported.");
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "displayId") && input.displayId !== 0) {
+    throw new ToolInputError("Video recording supports displayId 0 only.");
+  }
+}
+
+function recordVideoStartOptions(input: Record<string, unknown>): {
+  size?: string;
+  bitRate?: number;
+  timeLimitSec: number;
+  outputPath?: string;
+  overwrite: boolean;
+} {
+  validateRecordVideoDisplayTarget(input);
+  const size = optionalStringParam(input, "size");
+  if (size !== undefined && !/^[1-9]\d*x[1-9]\d*$/.test(size)) {
+    throw new ToolInputError("size must use WIDTHxHEIGHT with positive integers, for example 1280x720.");
+  }
+  const bitRateValue = input.bitRate;
+  const bitRate = bitRateValue === undefined || bitRateValue === null ? undefined : positiveNumberParam(input, "bitRate");
+  const timeLimitSec = optionalIntegerParam(input, "timeLimitSec", DEFAULT_RECORD_VIDEO_TIME_LIMIT_SEC);
+  if (timeLimitSec < 1 || timeLimitSec > DEFAULT_RECORD_VIDEO_TIME_LIMIT_SEC) {
+    throw new ToolInputError("timeLimitSec must be an integer from 1 through 180.");
+  }
+  return {
+    ...(size ? { size } : {}),
+    ...(bitRate !== undefined ? { bitRate } : {}),
+    timeLimitSec,
+    outputPath: optionalStringParam(input, "outputPath"),
+    overwrite: optionalBooleanParam(input, "overwrite", false)
+  };
+}
+
+async function withVideoRecordingLock<T>(deviceId: string, operation: () => Promise<T>): Promise<T> {
+  const previous = videoRecordingQueues.get(deviceId) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolveGate) => {
+    release = resolveGate;
+  });
+  const tail = previous.then(() => gate);
+  videoRecordingQueues.set(deviceId, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (videoRecordingQueues.get(deviceId) === tail) {
+      videoRecordingQueues.delete(deviceId);
+    }
+  }
+}
+
+async function existingPathType(path: string): Promise<"missing" | "file" | "directory" | "other"> {
+  try {
+    const info = await stat(path);
+    if (info.isFile()) return "file";
+    if (info.isDirectory()) return "directory";
+    return "other";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+    throw error;
+  }
+}
+
+async function validateVideoOutputPath(outputPath: string, overwrite: boolean): Promise<void> {
+  await mkdir(dirname(outputPath), { recursive: true });
+  const type = await existingPathType(outputPath);
+  if (type === "directory" || type === "other") {
+    throw new ToolInputError(`outputPath '${outputPath}' is not a regular file path.`);
+  }
+  if (type === "file" && !overwrite) {
+    throw new ToolInputError(`outputPath '${outputPath}' already exists; pass overwrite: true to replace it.`);
+  }
+}
+
+function generatedVideoOutputPath(deviceId: string, nowMs: number): string {
+  return join(RECORD_VIDEO_LOCAL_ROOT, safeFileName(deviceId), `recording-${nowMs}-${randomUUID().slice(0, 8)}.mp4`);
+}
+
+function releaseVideoOutputPath(outputPath: string, deviceId: string): void {
+  if (reservedVideoOutputPaths.get(outputPath) === deviceId) {
+    reservedVideoOutputPaths.delete(outputPath);
+  }
+}
+
+function videoResultFields(state: VideoRecordingState): ToolResult {
+  return {
+    deviceId: state.deviceId,
+    displayId: state.displayId,
+    pid: state.pid,
+    remotePath: state.remotePath,
+    outputPath: state.outputPath,
+    startedAt: state.startedAt,
+    elapsedSec: Number(Math.max(0, (videoRuntime.now() - state.startedAtMs) / 1000).toFixed(3)),
+    timeLimitSec: state.timeLimitSec,
+    ...(state.size ? { size: state.size } : {}),
+    ...(state.bitRate !== undefined ? { bitRate: state.bitRate } : {}),
+    ...(state.stoppedAt ? { stoppedAt: state.stoppedAt } : {}),
+    ...(state.fileSizeBytes !== undefined ? { fileSizeBytes: state.fileSizeBytes } : {}),
+    audio: false,
+    rotationWarning: RECORD_VIDEO_ROTATION_WARNING
+  };
+}
+
+async function videoProcessMatches(state: VideoRecordingState): Promise<boolean> {
+  const cmdline = await videoRuntime.adbText(
+    ["shell", `cat /proc/${state.pid}/cmdline 2>/dev/null || true`],
+    DEFAULT_TIMEOUT_MS,
+    state.deviceId
+  );
+  const normalized = cmdline.replace(/\0/g, " ");
+  return normalized.includes("screenrecord") && normalized.includes(state.remotePath);
+}
+
+async function signalVideoProcess(state: VideoRecordingState): Promise<boolean> {
+  const command = `cmdline=$(cat /proc/${state.pid}/cmdline 2>/dev/null | tr '\\000' ' '); case "$cmdline" in *screenrecord*${state.remotePath}*) kill -INT ${state.pid} 2>/dev/null && echo signaled || echo not_running ;; *) echo not_running ;; esac`;
+  const output = await videoRuntime.adbText(["shell", command], DEFAULT_TIMEOUT_MS, state.deviceId);
+  return output.trim() === "signaled";
+}
+
+async function readRemoteVideoLog(state: VideoRecordingState): Promise<string> {
+  const output = await videoRuntime.adbText(
+    ["shell", `cat ${state.remoteLogPath} 2>/dev/null || true`],
+    DEFAULT_TIMEOUT_MS,
+    state.deviceId
+  );
+  return truncate(output.trim(), 2_000);
+}
+
+async function cleanupRemoteVideoFiles(state: VideoRecordingState): Promise<void> {
+  const output = await videoRuntime.adbText(
+    ["shell", `rm -f ${state.remotePath} ${state.remoteLogPath} ${state.remotePidPath}; if [ ! -e ${state.remotePath} ] && [ ! -e ${state.remoteLogPath} ] && [ ! -e ${state.remotePidPath} ]; then echo cleaned; else echo cleanup_failed; fi`],
+    DEFAULT_TIMEOUT_MS,
+    state.deviceId
+  );
+  if (output.trim() !== "cleaned") {
+    throw new AdbCommandError("The local video was saved, but remote recording cleanup did not complete.", {
+      status: "cleanup_pending",
+      deviceId: state.deviceId,
+      remotePath: state.remotePath,
+      output: truncate(output.trim())
+    });
+  }
+}
+
+async function parseStartedVideoPid(deviceId: string, stdout: string, remotePidPath: string): Promise<number> {
+  let value = stdout.trim().split(/\s+/).at(-1) ?? "";
+  if (!/^[1-9]\d*$/.test(value)) {
+    value = (await videoRuntime.adbText(["shell", `cat ${remotePidPath} 2>/dev/null || true`], DEFAULT_TIMEOUT_MS, deviceId)).trim();
+  }
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new AdbCommandError("screenrecord started without returning a valid PID.", {
+      status: "recording_start_failed",
+      deviceId,
+      output: truncate(stdout.trim())
+    });
+  }
+  return Number(value);
+}
+
+async function androidRecordVideoStart(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  const options = recordVideoStartOptions(params);
+  const deviceId = await videoRuntime.resolveDeviceId(params);
+  return withVideoRecordingLock(deviceId, async () => {
+    const current = activeVideoRecordings.get(deviceId);
+    if (current) {
+      throw new ToolInputError(`Device '${deviceId}' already has a managed video recording in state '${current.phase}'.`);
+    }
+
+    const nowMs = videoRuntime.now();
+    const outputPath = options.outputPath ? resolve(options.outputPath) : generatedVideoOutputPath(deviceId, nowMs);
+    const reservedBy = reservedVideoOutputPaths.get(outputPath);
+    if (reservedBy !== undefined) {
+      throw new ToolInputError(`outputPath '${outputPath}' is already reserved by another active recording.`);
+    }
+    reservedVideoOutputPaths.set(outputPath, deviceId);
+
+    const recordingId = randomUUID();
+    const remotePath = `${RECORD_VIDEO_REMOTE_ROOT}/recording-${recordingId}.mp4`;
+    const remoteLogPath = `${RECORD_VIDEO_REMOTE_ROOT}/recording-${recordingId}.log`;
+    const remotePidPath = `${RECORD_VIDEO_REMOTE_ROOT}/recording-${recordingId}.pid`;
+    const arguments_ = [
+      ...(options.size ? ["--size", options.size] : []),
+      ...(options.bitRate !== undefined ? ["--bit-rate", String(options.bitRate)] : []),
+      "--time-limit",
+      String(options.timeLimitSec),
+      remotePath
+    ];
+    const command = `mkdir -p ${RECORD_VIDEO_REMOTE_ROOT} || exit 1; screenrecord ${arguments_.join(" ")} </dev/null >${remoteLogPath} 2>&1 & pid=$!; echo $pid >${remotePidPath}; echo $pid`;
+    let pid: number;
+    try {
+      await validateVideoOutputPath(outputPath, options.overwrite);
+      const stdout = await videoRuntime.adbText(["shell", command], DEFAULT_TIMEOUT_MS, deviceId);
+      pid = await parseStartedVideoPid(deviceId, stdout, remotePidPath);
+    } catch (error) {
+      releaseVideoOutputPath(outputPath, deviceId);
+      throw error;
+    }
+    const state: VideoRecordingState = {
+      deviceId,
+      displayId: 0,
+      pid,
+      phase: "recording",
+      remotePath,
+      remoteLogPath,
+      remotePidPath,
+      outputPath,
+      overwrite: options.overwrite,
+      startedAt: new Date(nowMs).toISOString(),
+      startedAtMs: nowMs,
+      timeLimitSec: options.timeLimitSec,
+      ...(options.size ? { size: options.size } : {}),
+      ...(options.bitRate !== undefined ? { bitRate: options.bitRate } : {})
+    };
+    activeVideoRecordings.set(deviceId, state);
+    await videoRuntime.sleep(RECORD_VIDEO_START_PROBE_DELAY_MS);
+    if (!(await videoProcessMatches(state))) {
+      const log = await readRemoteVideoLog(state).catch(() => "");
+      await cleanupRemoteVideoFiles(state).catch(() => undefined);
+      activeVideoRecordings.delete(deviceId);
+      releaseVideoOutputPath(outputPath, deviceId);
+      throw new AdbCommandError("screenrecord exited before the recording became active.", {
+        status: "recording_start_failed",
+        deviceId,
+        ...(log ? { log } : {})
+      });
+    }
+    return { success: true, status: "recording_started", ...videoResultFields(state) };
+  });
+}
+
+async function refreshVideoRecordingPhase(state: VideoRecordingState): Promise<void> {
+  if (state.phase === "recording" && !(await videoProcessMatches(state))) {
+    state.phase = "completed_pending_pull";
+    state.stoppedAt ??= new Date(videoRuntime.now()).toISOString();
+  }
+}
+
+async function androidRecordVideoStatus(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  validateRecordVideoDisplayTarget(params);
+  const deviceId = await videoRuntime.resolveDeviceId(params);
+  return withVideoRecordingLock(deviceId, async () => {
+    const state = activeVideoRecordings.get(deviceId);
+    if (!state) {
+      return { success: true, status: "recording_not_active", deviceId, displayId: 0, audio: false, rotationWarning: RECORD_VIDEO_ROTATION_WARNING };
+    }
+    await refreshVideoRecordingPhase(state);
+    return { success: true, status: state.phase, ...videoResultFields(state) };
+  });
+}
+
+async function commitPulledVideo(state: VideoRecordingState): Promise<void> {
+  await validateVideoOutputPath(state.outputPath, state.overwrite);
+  const stagingPath = `${state.outputPath}.android-ui-mcp-${randomUUID().slice(0, 8)}.part`;
+  try {
+    await videoRuntime.adbText(["pull", state.remotePath, stagingPath], RECORD_VIDEO_PULL_TIMEOUT_MS, state.deviceId);
+    const pulled = await stat(stagingPath);
+    if (!pulled.isFile() || pulled.size === 0) {
+      throw new AdbCommandError("screenrecord produced an empty or invalid local video file.", {
+        status: "recording_pull_failed",
+        deviceId: state.deviceId,
+        remotePath: state.remotePath
+      });
+    }
+    if (state.overwrite) {
+      await rename(stagingPath, state.outputPath);
+    } else {
+      await link(stagingPath, state.outputPath);
+      await unlink(stagingPath);
+    }
+    state.fileSizeBytes = pulled.size;
+    state.phase = "cleanup_pending";
+  } catch (error) {
+    await unlink(stagingPath).catch(() => undefined);
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ToolInputError(`outputPath '${state.outputPath}' was created while recording; remove it or restart with overwrite: true.`);
+    }
+    throw error;
+  }
+}
+
+async function androidRecordVideoStop(input: unknown): Promise<ToolResult> {
+  const params = optionalObject(input);
+  validateRecordVideoDisplayTarget(params);
+  const deviceId = await videoRuntime.resolveDeviceId(params);
+  return withVideoRecordingLock(deviceId, async () => {
+    const state = activeVideoRecordings.get(deviceId);
+    if (!state) {
+      return { success: true, status: "recording_not_active", deviceId, displayId: 0, audio: false, rotationWarning: RECORD_VIDEO_ROTATION_WARNING };
+    }
+
+    if (state.phase === "recording") {
+      if (await videoProcessMatches(state)) {
+        if (await signalVideoProcess(state)) {
+          const deadline = videoRuntime.now() + RECORD_VIDEO_STOP_TIMEOUT_MS;
+          while (videoRuntime.now() < deadline && await videoProcessMatches(state)) {
+            await videoRuntime.sleep(RECORD_VIDEO_POLL_INTERVAL_MS);
+          }
+          if (await videoProcessMatches(state)) {
+            return { success: false, status: "recording_stop_timeout", ...videoResultFields(state) };
+          }
+        }
+      }
+      state.phase = "completed_pending_pull";
+      state.stoppedAt ??= new Date(videoRuntime.now()).toISOString();
+    }
+
+    if (state.phase === "completed_pending_pull") {
+      await commitPulledVideo(state);
+    }
+    await cleanupRemoteVideoFiles(state);
+    activeVideoRecordings.delete(deviceId);
+    releaseVideoOutputPath(state.outputPath, deviceId);
+    return { success: true, status: "recording_stopped", ...videoResultFields(state) };
+  });
 }
 
 function optionalSelectorParam(input: Record<string, unknown>, name: string): NodeSelector | undefined {
@@ -3652,6 +4021,10 @@ const displayTargetProperties = {
   sessionId: { type: "string", minLength: 1, description: "MCP-owned virtual display session ID." },
   displayId: { type: "integer", minimum: 0, description: "Android display ID. Omit for the default physical display." }
 };
+const recordVideoDisplayProperties = {
+  sessionId: { type: "string", minLength: 1, description: "Unsupported in v1. Video recording is limited to display 0." },
+  displayId: { type: "integer", enum: [0], description: "Only display 0 is supported in v1." }
+};
 
 function sanitizeTraceValue(value: unknown, key = ""): unknown {
   if (key === "pngBase64" || key === "rawOcr" || key === "rawVision") return "[omitted]";
@@ -3721,6 +4094,7 @@ async function androidTraceStatus(): Promise<ToolResult> {
 
 function capabilityGroupForTool(name: string): CapabilityGroup {
   if (name.startsWith("android_trace_")) return "trace";
+  if (name.startsWith("android_record_video_")) return "media";
   if (name.startsWith("android_viewer_")) return "debug";
   if (name === "android_ocr_screen") return "ocr";
   if (["android_current_app", "android_wait_for_package", "android_list_apps", "android_launch_app"].includes(name)) return "apps";
@@ -3762,6 +4136,36 @@ const tools: ToolDefinition[] = [
     description: "Return whether a local trace is active and its current step count.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: androidTraceStatus
+  },
+  {
+    name: "android_record_video_start",
+    description: "Start one display-0 screenrecord session on an Android device. Audio is not recorded and display rotation may crop the video.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProperties,
+        ...recordVideoDisplayProperties,
+        size: { type: "string", pattern: "^[1-9]\\d*x[1-9]\\d*$", description: "Optional screenrecord size as WIDTHxHEIGHT, for example 1280x720." },
+        bitRate: { type: "integer", minimum: 1, description: "Optional video bit rate in bits per second." },
+        timeLimitSec: { type: "integer", minimum: 1, maximum: 180, default: 180 },
+        outputPath: { type: "string", minLength: 1, description: "Optional local output path. Relative paths are resolved against the MCP process working directory." },
+        overwrite: { type: "boolean", default: false, description: "Allow replacing an existing local output file." }
+      },
+      additionalProperties: false
+    },
+    handler: androidRecordVideoStart
+  },
+  {
+    name: "android_record_video_status",
+    description: "Report the managed display-0 screenrecord state without pulling or deleting the remote file.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...recordVideoDisplayProperties }, additionalProperties: false },
+    handler: androidRecordVideoStatus
+  },
+  {
+    name: "android_record_video_stop",
+    description: "Stop the managed display-0 screenrecord with SIGINT, pull the finalized MP4, and delete the remote recording files.",
+    inputSchema: { type: "object", properties: { ...deviceProperties, ...recordVideoDisplayProperties }, additionalProperties: false },
+    handler: androidRecordVideoStop
   },
   {
     name: "android_viewer_start",
@@ -4504,5 +4908,20 @@ export const __test = {
   androidTraceStart,
   androidTraceStatus,
   androidTraceStop,
-  recordTraceEvent
+  recordTraceEvent,
+  recordVideoStartOptions,
+  validateRecordVideoDisplayTarget,
+  androidRecordVideoStart,
+  androidRecordVideoStatus,
+  androidRecordVideoStop,
+  activeVideoRecordings,
+  setVideoRuntime: (overrides: Partial<VideoRuntime>) => {
+    videoRuntime = { ...videoRuntime, ...overrides };
+  },
+  resetVideoRuntime: () => {
+    videoRuntime = { ...defaultVideoRuntime };
+    activeVideoRecordings.clear();
+    videoRecordingQueues.clear();
+    reservedVideoOutputPaths.clear();
+  }
 };
