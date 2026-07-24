@@ -6,7 +6,7 @@ import readline from "node:readline";
 const deviceId = process.env.ANDROID_SERIAL;
 if (!deviceId) throw new Error("Set ANDROID_SERIAL to an Android 14+ device serial.");
 
-// Start from a deterministic task state; Settings otherwise restores its last search activity.
+// Start from a deterministic task state; the target app otherwise restores its last search activity.
 execFileSync("adb", ["-s", deviceId, "shell", "am", "force-stop", "com.android.settings"]);
 execFileSync("adb", ["-s", deviceId, "shell", "am", "force-stop", "com.google.android.settings.intelligence"]);
 execFileSync("adb", ["-s", deviceId, "shell", "pm", "clear", "com.android.camera2"]);

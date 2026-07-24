@@ -17,19 +17,19 @@ test("semantic ranking prioritizes editable action targets", () => {
 
 test("semantic merge deduplicates OCR overlapping accessibility text", () => {
   const merged = __test.mergeSemanticNodes(
-    [node({ id: "a", text: "Settings" })],
-    [node({ id: "o", text: "Settings", source: "ocr", confidence: 90 })],
+    [node({ id: "a", text: "Sample label" })],
+    [node({ id: "o", text: "Sample label", source: "ocr", confidence: 90 })],
     [],
     10
   );
-  assert.equal(merged.filter((item) => item.text === "Settings").length, 1);
+  assert.equal(merged.filter((item) => item.text === "Sample label").length, 1);
   assert.equal(merged[0].source, "accessibility");
 });
 
 test("compact accessibility metadata survives semantic conversion", () => {
   const [item] = __test.compactNodes({
     nodes: [{
-      text: "Wi-Fi",
+      text: "Sample setting",
       bounds: "[0,120][1080,220]",
       clickable: true,
       checkable: true,
@@ -49,11 +49,11 @@ test("compact accessibility metadata survives semantic conversion", () => {
 
 test("UI outline zones nodes, assigns scoped list aliases, and preserves refs compactly", () => {
   const nodes = __test.mergeSemanticNodes([
-    node({ id: "title", text: "Settings", bounds: [20, 20, 400, 100], center: [210, 60] }),
-    node({ id: "wifi", text: "Network & internet", clickable: true, bounds: [20, 300, 1000, 420], center: [510, 360], collectionScope: 1, collectionItem: { rowIndex: 0, rowSpan: 1, columnIndex: 0, columnSpan: 1 } }),
-    node({ id: "apps", text: "Apps", clickable: true, bounds: [20, 440, 1000, 560], center: [510, 500], collectionScope: 1, collectionItem: { rowIndex: 1, rowSpan: 1, columnIndex: 0, columnSpan: 1 } }),
-    node({ id: "save", text: "Save", clickable: true, className: "android.widget.Button", bounds: [800, 2200, 1040, 2320], center: [920, 2260] }),
-    node({ id: "dialog", text: "Allow", clickable: true, className: "android.widget.Button", bounds: [360, 900, 720, 1020], center: [540, 960], windowIndex: 1 })
+    node({ id: "title", text: "Sample screen", bounds: [20, 20, 400, 100], center: [210, 60] }),
+    node({ id: "first-option", text: "First option", clickable: true, bounds: [20, 300, 1000, 420], center: [510, 360], collectionScope: 1, collectionItem: { rowIndex: 0, rowSpan: 1, columnIndex: 0, columnSpan: 1 } }),
+    node({ id: "second-option", text: "Second option", clickable: true, bounds: [20, 440, 1000, 560], center: [510, 500], collectionScope: 1, collectionItem: { rowIndex: 1, rowSpan: 1, columnIndex: 0, columnSpan: 1 } }),
+    node({ id: "confirm", text: "Confirm", clickable: true, className: "android.widget.Button", bounds: [800, 2200, 1040, 2320], center: [920, 2260] }),
+    node({ id: "dialog", text: "Accept", clickable: true, className: "android.widget.Button", bounds: [360, 900, 720, 1020], center: [540, 960], windowIndex: 1 })
   ], [], [], 20);
   const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
   const rendered = __test.renderUiOutline(snapshot, 20);
@@ -61,8 +61,8 @@ test("UI outline zones nodes, assigns scoped list aliases, and preserves refs co
   assert.match(rendered.outline, /\[Top\]/);
   assert.match(rendered.outline, /\[Content\]/);
   assert.match(rendered.outline, /\[Bottom\]/);
-  assert.match(rendered.outline, /#1 button \"Network & internet\"/);
-  assert.match(rendered.outline, /#2 button \"Apps\"/);
+  assert.match(rendered.outline, /#1 button \"First option\"/);
+  assert.match(rendered.outline, /#2 button \"Second option\"/);
   for (const item of nodes.filter((value) => value.clickable)) {
     assert.match(rendered.outline, new RegExp(`\\b${item.ref}\\b`));
   }
@@ -91,18 +91,18 @@ test("UI outline retains unlabeled actionable accessibility refs", () => {
 
 test("outline promotes one contained passive label onto an unlabeled clickable parent", () => {
   const nodes = __test.mergeSemanticNodes([
-    node({ id: "sort", clickable: true, bounds: [828, 254, 933, 380], center: [880, 317] }),
-    node({ id: "sort-label", text: "Choose contact sort order", bounds: [870, 296, 912, 338], center: [891, 317] })
+    node({ id: "control", clickable: true, bounds: [828, 254, 933, 380], center: [880, 317] }),
+    node({ id: "control-label", text: "Choose display order", bounds: [870, 296, 912, 338], center: [891, 317] })
   ], [], [], 10);
   const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
   const rendered = __test.renderUiOutline(snapshot, 10);
-  const button = nodes.find((item) => item.id === "sort");
+  const button = nodes.find((item) => item.id === "control");
 
   assert.equal(button.role, "button");
-  assert.equal(button.label, "Choose contact sort order");
-  assert.equal(button.labelSourceId, "sort-label");
-  assert.match(rendered.outline, /button "Choose contact sort order"/);
-  assert.doesNotMatch(rendered.outline, /text "Choose contact sort order"/);
+  assert.equal(button.label, "Choose display order");
+  assert.equal(button.labelSourceId, "control-label");
+  assert.match(rendered.outline, /button "Choose display order"/);
+  assert.doesNotMatch(rendered.outline, /text "Choose display order"/);
 });
 
 test("outline does not promote ambiguous contained labels", () => {
@@ -118,13 +118,13 @@ test("outline does not promote ambiguous contained labels", () => {
 
 test("semantic snapshots preserve and outline the complete primary navigation collection", () => {
   const navigationScope = 7;
-  const items = ["Contact", "Calls", "Chat", "Find"].flatMap((label, index) => {
+  const items = ["First", "Second", "Third", "Fourth"].flatMap((label, index) => {
     const left = 20 + index * 260;
     return [
       node({
         id: `tab-${label}`,
-        clickable: label !== "Chat",
-        selected: label === "Chat",
+        clickable: label !== "Third",
+        selected: label === "Third",
         bounds: [left, 2160, left + 220, 2320],
         center: [left + 110, 2240],
         collectionScope: navigationScope,
@@ -135,7 +135,7 @@ test("semantic snapshots preserve and outline the complete primary navigation co
   });
   const nodes = __test.mergeSemanticNodes([
     node({ id: "nav-collection", bounds: [0, 2140, 1080, 2340], center: [540, 2240], collectionScope: navigationScope, collection: { rowCount: 1, columnCount: 4 } }),
-    ...Array.from({ length: 8 }, (_, index) => node({ id: `message-${index}`, text: `Message ${index}`, clickable: true, bounds: [0, 200 + index * 100, 1000, 280 + index * 100], center: [500, 240 + index * 100] })),
+    ...Array.from({ length: 8 }, (_, index) => node({ id: `content-${index}`, text: `Content ${index}`, clickable: true, bounds: [0, 200 + index * 100, 1000, 280 + index * 100], center: [500, 240 + index * 100] })),
     ...items
   ], [], [], 5);
   const snapshot = { deviceId: "test", displayId: 0, snapshotId: "s", screenSignature: "x", actionableSignature: "y", width: 1080, height: 2400, nodes, nodeCount: nodes.length };
@@ -143,15 +143,15 @@ test("semantic snapshots preserve and outline the complete primary navigation co
 
   assert.equal(nodes.filter((item) => item.landmark === "primary_navigation").length, 4);
   assert.match(rendered.outline, /\[Primary navigation\]/);
-  assert.match(rendered.outline, /tab "Contact"/);
-  assert.match(rendered.outline, /tab "Calls"/);
-  assert.match(rendered.outline, /tab "Chat" \[selected\]/);
-  assert.match(rendered.outline, /tab "Find"/);
-  assert.doesNotMatch(rendered.outline, /text "Contact"/);
+  assert.match(rendered.outline, /tab "First"/);
+  assert.match(rendered.outline, /tab "Second"/);
+  assert.match(rendered.outline, /tab "Third" \[selected\]/);
+  assert.match(rendered.outline, /tab "Fourth"/);
+  assert.doesNotMatch(rendered.outline, /text "First"/);
 });
 
 test("semantic snapshots recognize aligned bottom buttons without collection metadata", () => {
-  const labels = ["Home", "Shorts", "Subscriptions", "Library"];
+  const labels = ["First", "Second", "Third", "Fourth"];
   const nodes = __test.mergeSemanticNodes(labels.flatMap((label, index) => {
     const left = index * 270;
     return [node({
@@ -159,7 +159,7 @@ test("semantic snapshots recognize aligned bottom buttons without collection met
       contentDesc: label,
       className: "android.widget.Button",
       clickable: true,
-      selected: label === "Home",
+      selected: label === "First",
       bounds: [left, 2211, left + 270, 2337],
       center: [left + 135, 2274]
     })];
@@ -169,8 +169,8 @@ test("semantic snapshots recognize aligned bottom buttons without collection met
 
   assert.equal(nodes.filter((item) => item.landmark === "primary_navigation").length, 4);
   assert.match(rendered.outline, /\[Primary navigation\]/);
-  assert.match(rendered.outline, /tab "Home" \[selected,clickable\]/);
-  assert.match(rendered.outline, /tab "Subscriptions"/);
+  assert.match(rendered.outline, /tab "First" \[selected,clickable\]/);
+  assert.match(rendered.outline, /tab "Third"/);
 });
 
 test("UI outline tool schema defaults to a compact response", () => {
@@ -191,10 +191,10 @@ test("Viewer companion tools are debug-scoped and safe by default", () => {
 });
 
 test("stale ref relocation rejects ambiguous duplicate text", () => {
-  const original = node({ id: "old", text: "Allow", role: "button", className: "android.widget.Button" });
+  const original = node({ id: "old", text: "Confirm", role: "button", className: "android.widget.Button" });
   const relocated = __test.relocateAccessibilityNode(original, [
-    node({ id: "one", text: "Allow", role: "button", className: "android.widget.Button" }),
-    node({ id: "two", text: "Allow", role: "button", className: "android.widget.Button", bounds: [0, 50, 100, 90] })
+    node({ id: "one", text: "Confirm", role: "button", className: "android.widget.Button" }),
+    node({ id: "two", text: "Confirm", role: "button", className: "android.widget.Button", bounds: [0, 50, 100, 90] })
   ]);
   assert.equal(relocated.status, "stale_ref_ambiguous");
   assert.equal(relocated.candidates.length, 2);
